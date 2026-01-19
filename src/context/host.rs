@@ -145,16 +145,16 @@ impl LinuxContext {
             cr3: Cr3::read().0.start_address().as_u64(),
             cr4: Cr4::read(),
             efer: Efer::read(),
-            star: Msr::IA32_STAR.read(),
-            lstar: Msr::IA32_LSTAR.read(),
-            cstar: Msr::IA32_CSTAR.read(),
-            fmask: Msr::IA32_FMASK.read(),
+            star: Msr::STAR.read(),
+            lstar: Msr::LSTAR.read(),
+            cstar: Msr::CSTAR.read(),
+            fmask: Msr::SYSCALL_MASK.read(),
             ia32_sysenter_cs: Msr::IA32_SYSENTER_CS.read(),
             ia32_sysenter_esp: Msr::IA32_SYSENTER_ESP.read(),
             ia32_sysenter_eip: Msr::IA32_SYSENTER_EIP.read(),
-            kernel_gsbase: Msr::IA32_KERNEL_GSBASE.read(),
+            kernel_gsbase: Msr::KERNEL_GSBASE.read(),
             pat: Msr::IA32_PAT.read(),
-            mtrr_def_type: Msr::IA32_MTRR_DEF_TYPE.read(),
+            mtrr_def_type: Msr::MTRR_DEF_TYPE.read(),
         }
     }
 
@@ -251,11 +251,11 @@ impl LinuxContext {
             Msr::IA32_SYSENTER_EIP.write(self.ia32_sysenter_eip);
 
             Efer::write(self.efer);
-            Msr::IA32_STAR.write(self.star);
-            Msr::IA32_LSTAR.write(self.lstar);
-            Msr::IA32_CSTAR.write(self.cstar);
-            Msr::IA32_FMASK.write(self.fmask);
-            Msr::IA32_KERNEL_GSBASE.write(self.kernel_gsbase);
+            Msr::STAR.write(self.star);
+            Msr::LSTAR.write(self.lstar);
+            Msr::CSTAR.write(self.cstar);
+            Msr::SYSCALL_MASK.write(self.fmask);
+            Msr::KERNEL_GSBASE.write(self.kernel_gsbase);
             Msr::IA32_PAT.write(self.pat);
 
             Cr0::write(self.cr0);

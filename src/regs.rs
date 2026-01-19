@@ -1,3 +1,5 @@
+use crate::context::VCpuSetupContext;
+
 /// General-purpose registers for the 64-bit x86 architecture.
 ///
 /// This structure holds the values of the general-purpose registers
@@ -53,13 +55,33 @@ impl GeneralRegisters {
         }
     }
 
-    pub fn load_from_context(&mut self, context: &crate::context::LinuxContext) {
-        self.rbx = context.rbx;
-        self.rbp = context.rbp;
-        self.r12 = context.r12;
-        self.r13 = context.r13;
-        self.r14 = context.r14;
-        self.r15 = context.r15;
+    // pub fn load_from_context(&mut self, context: &crate::context::LinuxContext) {
+    //     self.rbx = context.rbx;
+    //     self.rbp = context.rbp;
+    //     self.r12 = context.r12;
+    //     self.r13 = context.r13;
+    //     self.r14 = context.r14;
+    //     self.r15 = context.r15;
+    // }
+
+    pub fn load_from_context(&mut self, context: &VCpuSetupContext) {
+        match context {
+            VCpuSetupContext::HostContext(ctx) => {
+                self.rbx = ctx.rbx;
+                self.rbp = ctx.rbp;
+                self.r12 = ctx.r12;
+                self.r13 = ctx.r13;
+                self.r14 = ctx.r14;
+                self.r15 = ctx.r15;
+            }
+            VCpuSetupContext::Linux64BitBoot(ctx) => {
+                self.rbp = ctx.rbp;
+                self.rsi = ctx.rsi;
+            }
+            _ => {
+                warn!("Unsupported VCpuSetupContext {:?} in load_from_context", context);
+            }
+        }
     }
 
     /// Returns the value of the general-purpose register corresponding to the given index.

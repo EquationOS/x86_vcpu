@@ -21,6 +21,8 @@ mod segmentation;
 // mod tables;
 mod xstate;
 
+mod generated;
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "vmx")] {
         mod vmx;
@@ -33,6 +35,6 @@ cfg_if::cfg_if! {
     }
 }
 
-pub use context::LinuxContext;
+pub use context::{Linux64BitBootContext, LinuxContext, VCpuSetupContext};
 pub use regs::GeneralRegisters;
 pub use vender::has_hardware_support;

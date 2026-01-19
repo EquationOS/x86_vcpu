@@ -90,6 +90,32 @@ impl Segment {
         }
     }
 
+    pub fn from_raw_entry_value(entry_value: u64, index: u64) -> Self {
+        let selector = SegmentSelector::new(index as u16, x86::Ring::Ring0);
+
+        let entry = DescriptorFlags::from_bits_truncate(entry_value);
+        if entry.contains(DescriptorFlags::PRESENT) {
+            let mut base = entry_value.get_bits(16..40) | entry_value.get_bits(56..64) << 24;
+            let mut limit = entry_value.get_bits(0..16) | entry_value.get_bits(48..52) << 16;
+            if !entry.contains(DescriptorFlags::USER_SEGMENT) {
+                // System segment (e.g., TSS)
+                let high = 0; // For system segments, the high 32 bits are in the next GDT entry
+                base += high << 32;
+            }
+            if entry.contains(DescriptorFlags::GRANULARITY) {
+                limit = (limit << 12) | 0xfff;
+            }
+            Self {
+                selector,
+                base,
+                limit: limit as _,
+                access_rights: SegmentAccessRights::from_descriptor(entry_value),
+            }
+        } else {
+            Self::invalid()
+        }
+    }
+
     pub fn from_selector(selector: SegmentSelector, gdt: &DescriptorTablePointer) -> Self {
         let index = selector.index() as usize;
         let entry_count = (gdt.limit as usize + 1) / size_of::<u64>();

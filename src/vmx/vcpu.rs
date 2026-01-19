@@ -31,7 +31,7 @@ use super::vmcs::{
     VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, exit_qualification,
     interrupt_exit_info,
 };
-use crate::LinuxContext;
+use crate::context::{Linux64BitBootContext, LinuxContext, VCpuSetupContext};
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
 use crate::segmentation::{Segment, SegmentAccessRights};
@@ -455,7 +455,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         &mut self,
         ept_root: HostPhysAddr,
         entry: Option<GuestPhysAddr>,
-        ctx: Option<LinuxContext>,
+        ctx: VCpuSetupContext,
     ) -> AxResult {
         let mut is_guest = true;
 
@@ -465,14 +465,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
         self.bind_to_current_processor()?;
 
-        if let Some(ctx) = ctx {
-            is_guest = false;
-            self.setup_vmcs_guest_from_ctx(ctx)?;
-        } else {
-            self.setup_vmcs_guest(entry.ok_or_else(|| {
-                error!("VmxVcpu::setup_vmcs: entry is None");
-                ax_err_type!(InvalidInput)
-            })?)?;
+        match ctx {
+            VCpuSetupContext::InitialBoot => {
+                self.setup_vmcs_guest(entry.ok_or_else(|| {
+                    error!("VmxVcpu::setup_vmcs: entry is None");
+                    ax_err_type!(InvalidInput)
+                })?)?;
+            }
+
+            VCpuSetupContext::HostContext(host_ctx) => {
+                is_guest = false;
+                self.setup_vmcs_guest_from_ctx(host_ctx)?;
+            }
+            VCpuSetupContext::Linux64BitBoot(ctx) => {
+                is_guest = false;
+                self.setup_vmcs_guest_from_pvboot_ctx(ctx)?;
+            }
         }
 
         self.setup_vmcs_control(ept_root, is_guest)?;
@@ -517,6 +525,106 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsHostNW::IA32_SYSENTER_ESP.write(0)?;
         VmcsHostNW::IA32_SYSENTER_EIP.write(0)?;
         VmcsHost32::IA32_SYSENTER_CS.write(0)?;
+
+        Ok(())
+    }
+
+    /// Indeed, this function can be combined with `setup_vmcs_guest`,
+    /// to avoid complexity and minimize the modification,
+    /// we just keep them separated.
+    fn setup_vmcs_guest_from_pvboot_ctx(&mut self, ctx: Linux64BitBootContext) -> AxResult {
+        warn!(
+            "VCpu[{}] setup_vmcs_guest_from_pvboot_ctx: {:#x?}",
+            self.id, ctx
+        );
+
+        self.set_cr(0, ctx.cr0.bits());
+        self.set_cr(4, ctx.cr4.bits());
+        self.set_cr(3, ctx.cr3);
+
+        macro_rules! set_guest_segment {
+            ($seg: expr, $reg: ident) => {{
+                use VmcsGuest16::*;
+                use VmcsGuest32::*;
+                use VmcsGuestNW::*;
+                concat_idents!($reg, _SELECTOR).write($seg.selector.bits())?;
+                concat_idents!($reg, _BASE).write($seg.base as _)?;
+                concat_idents!($reg, _LIMIT).write($seg.limit)?;
+                concat_idents!($reg, _ACCESS_RIGHTS).write($seg.access_rights.bits())?;
+            }};
+        }
+
+        set_guest_segment!(ctx.es, ES);
+        set_guest_segment!(ctx.cs, CS);
+        set_guest_segment!(ctx.ss, SS);
+        set_guest_segment!(ctx.ds, DS);
+        set_guest_segment!(ctx.fs, FS);
+        set_guest_segment!(ctx.gs, GS);
+        set_guest_segment!(ctx.tss, TR);
+        set_guest_segment!(Segment::invalid(), LDTR);
+
+        VmcsGuestNW::GDTR_BASE.write(ctx.gdt.base.as_u64() as _)?;
+        VmcsGuest32::GDTR_LIMIT.write(ctx.gdt.limit as _)?;
+        VmcsGuestNW::IDTR_BASE.write(ctx.idt.base.as_u64() as _)?;
+        VmcsGuest32::IDTR_LIMIT.write(ctx.idt.limit as _)?;
+
+        VmcsGuestNW::RSP.write(ctx.rsp as _)?;
+        VmcsGuestNW::RIP.write(ctx.rip as _)?;
+        VmcsGuestNW::RFLAGS.write(ctx.rflags as _)?;
+
+        VmcsGuestNW::DR7.write(0x400)?;
+        VmcsGuest64::IA32_DEBUGCTL.write(0)?;
+
+        VmcsGuest32::ACTIVITY_STATE.write(0)?;
+        VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
+        VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
+
+        VmcsGuest64::LINK_PTR.write(u64::MAX)?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+
+        for msr_entry in ctx.msr_entries {
+            match msr_entry.index {
+                Msr::IA32_SYSENTER_CS => {
+                    VmcsGuest32::IA32_SYSENTER_CS.write(msr_entry.data as _)?;
+                }
+                Msr::IA32_SYSENTER_ESP => {
+                    VmcsGuestNW::IA32_SYSENTER_ESP.write(msr_entry.data as _)?;
+                }
+                Msr::IA32_SYSENTER_EIP => {
+                    VmcsGuestNW::IA32_SYSENTER_EIP.write(msr_entry.data as _)?;
+                }
+                // x86_64 specific msrs
+                Msr::STAR | Msr::CSTAR | Msr::KERNEL_GSBASE | Msr::SYSCALL_MASK | Msr::LSTAR => {
+                    // These MSRs are not supported in VMX guest state fields.
+                    warn!(
+                        "PVBootContext contains unsupported MSR entry: {:?}",
+                        msr_entry.index
+                    );
+                }
+                // end of x86_64 specific code
+                Msr::IA32_TSC => unsafe {
+                    Msr::IA32_TSC.write(msr_entry.data);
+                },
+                Msr::IA32_MISC_ENABLE => unsafe {
+                    Msr::IA32_MISC_ENABLE.write(msr_entry.data);
+                },
+                Msr::MTRR_DEF_TYPE => unsafe {
+                    Msr::MTRR_DEF_TYPE.write(msr_entry.data);
+                }
+                Msr::IA32_PAT => {
+                    VmcsGuest64::IA32_PAT.write(msr_entry.data)?;
+                }
+                Msr::IA32_EFER => {
+                    VmcsGuest64::IA32_EFER.write(msr_entry.data)?;
+                }
+                _ => {
+                    warn!(
+                        "PVBootContext contains unsupported MSR entry: {:?}",
+                        msr_entry.index
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1389,6 +1497,8 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
 
     type HostContext = crate::context::LinuxContext;
 
+    type VCpuSetupContext = crate::context::VCpuSetupContext;
+
     fn new(id: Self::CreateConfig) -> AxResult<Self> {
         Self::new(id)
     }
@@ -1411,12 +1521,16 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
     }
 
     fn setup(&mut self, _config: Self::SetupConfig) -> AxResult {
-        self.setup_vmcs(self.ept_root.unwrap(), self.entry, None)
+        self.setup_vmcs(
+            self.ept_root.unwrap(),
+            self.entry,
+            VCpuSetupContext::InitialBoot,
+        )
     }
 
-    fn setup_from_context(&mut self, ctx: Self::HostContext) -> AxResult {
+    fn setup_from_context(&mut self, ctx: Self::VCpuSetupContext) -> AxResult {
         self.guest_regs.load_from_context(&ctx);
-        self.setup_vmcs(self.ept_root.unwrap(), None, Some(ctx))
+        self.setup_vmcs(self.ept_root.unwrap(), None, ctx)
     }
 
     fn run(&mut self) -> AxResult<AxVCpuExitReason> {
