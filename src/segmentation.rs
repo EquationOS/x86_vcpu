@@ -28,6 +28,8 @@ bitflags! {
         const CODE_DATA         = 1 << 4;
         /// P — Segment present
         const PRESENT           = 1 << 7;
+        /// AVL — Available for use by system software
+        const AVL               = 1 << 12;
         /// L - Reserved (except for CS) or 64-bit mode active (for CS only)
         const LONG_MODE         = 1 << 13;
         /// D/B — Default operation size (0 = 16-bit segment; 1 = 32-bit segment)
@@ -44,6 +46,22 @@ bitflags! {
 
         /// Descriptor privilege level (User)
         const DPL_USER          = 3 << 5;
+    }
+}
+
+impl core::fmt::Display for SegmentAccessRights {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "SegmentAccessRights({:#x})", self.bits())?;
+        writeln!(f, "  type_: {:#x}", self.bits().get_bits(0..=3))?;
+        writeln!(f, "  present: {:#x}", self.bits().get_bits(7..=7))?;
+        writeln!(f, "  dpl: {:#x}", self.dpl())?;
+        writeln!(f, "  db: {:#x}", self.bits().get_bits(14..=14))?;
+        writeln!(f, "  s: {:#x}", self.bits().get_bits(4..=4))?;
+        writeln!(f, "  l: {:#x}", self.bits().get_bits(13..=13))?;
+        writeln!(f, "  g: {:#x}", self.bits().get_bits(15..=15))?;
+        writeln!(f, "  avl: {:#x}", self.bits().get_bits(12..=12))?;
+        writeln!(f, "  unusable: {:#x}", self.bits().get_bits(16..=16))?;
+        Ok(())
     }
 }
 
@@ -78,6 +96,17 @@ pub struct Segment {
     pub base: u64,
     pub limit: u32,
     pub access_rights: SegmentAccessRights,
+}
+
+impl core::fmt::Display for Segment {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "Segment:")?;
+        writeln!(f, "  Base: {:#x}", self.base)?;
+        writeln!(f, "  Limit: {:#x}", self.limit)?;
+        writeln!(f, "  Selector: {:#x}", self.selector.bits())?;
+        writeln!(f, "  Access Rights:\n{}", self.access_rights)?;
+        Ok(())
+    }
 }
 
 impl Segment {

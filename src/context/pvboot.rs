@@ -40,7 +40,7 @@ const X86_CR4_PAE: u64 = 0x20;
 // Initial pagetables.
 const PML4_START: u64 = 0x9000;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Linux64BitBootContext {
     // General purpose registers
     pub rsp: u64,
@@ -73,6 +73,34 @@ pub struct Linux64BitBootContext {
     // Floating-Point Unit (FPU) registers
     pub fcw: u16,
     pub mxcsr: u32,
+}
+
+impl core::fmt::Debug for Linux64BitBootContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "Linux64BitBootContext {{")?;
+        writeln!(f, "  rsp: {:#x}", self.rsp)?;
+        writeln!(f, "  rip: {:#x}", self.rip)?;
+        writeln!(f, "  rbp: {:#x}", self.rbp)?;
+        writeln!(f, "  rsi: {:#x}", self.rsi)?;
+        writeln!(f, "  rflags: {:#x}", self.rflags)?;
+        writeln!(f, "  cs: {}", self.cs)?;
+        writeln!(f, "  ds: {}", self.ds)?;
+        writeln!(f, "  es: {}", self.es)?;
+        writeln!(f, "  fs: {}", self.fs)?;
+        writeln!(f, "  gs: {}", self.gs)?;
+        writeln!(f, "  ss: {}", self.ss)?;
+        writeln!(f, "  tss: {}", self.tss)?;
+        writeln!(f, "  gdt: {:?}", self.gdt)?;
+        writeln!(f, "  idt: {:?}", self.idt)?;
+        writeln!(f, "  cr0: {:#x} {:?}", self.cr0.bits(), self.cr0)?;
+        writeln!(f, "  cr3: {:#x}", self.cr3)?;
+        writeln!(f, "  cr4: {:?}", self.cr4)?;
+        writeln!(f, "  efer: {:?}", self.efer)?;
+        writeln!(f, "  msr_entries: {:?}", self.msr_entries)?;
+        writeln!(f, "  fcw: {:#x}", self.fcw)?;
+        writeln!(f, "  mxcsr: {:#x}", self.mxcsr)?;
+        writeln!(f, "}}")
+    }
 }
 
 /// Constructor for a conventional segment GDT (or LDT) entry. Derived from the kernel's segment.h.
@@ -120,10 +148,14 @@ impl Default for Linux64BitBootContext {
                 limit: u16::try_from(mem::size_of::<u64>()).unwrap() - 1,
                 base: VirtAddr::new(BOOT_IDT_OFFSET),
             },
-            cr0: Cr0Flags::from_bits_truncate(X86_CR0_PE | X86_CR0_PG),
+            cr0: Cr0Flags::EXTENSION_TYPE
+                | Cr0Flags::PROTECTED_MODE_ENABLE
+                | Cr0Flags::PAGING
+                | Cr0Flags::NOT_WRITE_THROUGH
+                | Cr0Flags::CACHE_DISABLE,
             cr3: PML4_START,
-            cr4: Cr4Flags::from_bits_truncate(X86_CR4_PAE),
-            efer: EferFlags::from_bits_truncate(EFER_LME | EFER_LMA),
+            cr4: Cr4Flags::PHYSICAL_ADDRESS_EXTENSION,
+            efer: EferFlags::LONG_MODE_ENABLE | EferFlags::LONG_MODE_ACTIVE,
             msr_entries: create_boot_msr_entries(),
             fcw: 0x37f,
             mxcsr: 0x1f80,

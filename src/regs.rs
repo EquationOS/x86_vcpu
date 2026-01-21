@@ -79,7 +79,10 @@ impl GeneralRegisters {
                 self.rsi = ctx.rsi;
             }
             _ => {
-                warn!("Unsupported VCpuSetupContext {:?} in load_from_context", context);
+                warn!(
+                    "Unsupported VCpuSetupContext {:?} in load_from_context",
+                    context
+                );
             }
         }
     }
