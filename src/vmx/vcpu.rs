@@ -554,6 +554,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             }};
         }
 
+        macro_rules! set_guest_segment_raw {
+            ($access_rights: expr, $seg: ident) => {{
+                use VmcsGuest16::*;
+                use VmcsGuest32::*;
+                use VmcsGuestNW::*;
+                concat_idents!($seg, _SELECTOR).write(0)?;
+                concat_idents!($seg, _BASE).write(0)?;
+                concat_idents!($seg, _LIMIT).write(0xffff)?;
+                concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
+            }};
+        }
+
         set_guest_segment!(ctx.es, ES);
         set_guest_segment!(ctx.cs, CS);
         set_guest_segment!(ctx.ss, SS);
@@ -561,7 +573,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         set_guest_segment!(ctx.fs, FS);
         set_guest_segment!(ctx.gs, GS);
         set_guest_segment!(ctx.tss, TR);
-        set_guest_segment!(Segment::invalid(), LDTR);
+        set_guest_segment_raw!(0x82, LDTR); // present, system, LDT
 
         VmcsGuestNW::GDTR_BASE.write(ctx.gdt.base.as_u64() as _)?;
         VmcsGuest32::GDTR_LIMIT.write(ctx.gdt.limit as _)?;
@@ -581,6 +593,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         VmcsGuest64::LINK_PTR.write(u64::MAX)?;
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+
+        let ia32_pat = Msr::IA32_PAT.read();
+        debug!("Guest IA32_PAT {:#x}", ia32_pat);
+        debug!("Guest IA32_EFER {:#x}", ctx.efer.bits());
+
+        VmcsGuest64::IA32_PAT.write(ia32_pat)?;
+        VmcsGuest64::IA32_EFER.write(ctx.efer.bits())?;
 
         for msr_entry in ctx.msr_entries {
             match msr_entry.index {
@@ -610,13 +629,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 },
                 Msr::MTRR_DEF_TYPE => unsafe {
                     Msr::MTRR_DEF_TYPE.write(msr_entry.data);
-                }
-                Msr::IA32_PAT => {
-                    VmcsGuest64::IA32_PAT.write(msr_entry.data)?;
-                }
-                Msr::IA32_EFER => {
-                    VmcsGuest64::IA32_EFER.write(msr_entry.data)?;
-                }
+                },
                 _ => {
                     warn!(
                         "PVBootContext contains unsupported MSR entry: {:?}",
@@ -1346,8 +1359,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                         || x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
                         || x.contains(Xcr0::XCR0_HI16_ZMM_STATE))
                         && (!x.contains(Xcr0::XCR0_AVX_STATE)
-                        || !x.contains(Xcr0::XCR0_OPMASK_STATE)
-                        || !x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
+                            || !x.contains(Xcr0::XCR0_OPMASK_STATE)
+                            || !x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
                             || !x.contains(Xcr0::XCR0_HI16_ZMM_STATE))
                     {
                         return None;
