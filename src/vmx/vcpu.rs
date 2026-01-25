@@ -32,6 +32,7 @@ use super::vmcs::{
     interrupt_exit_info,
 };
 use crate::context::{Linux64BitBootContext, LinuxContext, VCpuSetupContext};
+use crate::generated::msr_index::{MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST};
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
 use crate::segmentation::{Segment, SegmentAccessRights};
@@ -54,6 +55,13 @@ pub enum VmCpuMode {
 const MSR_IA32_EFER_LMA_BIT: u64 = 1 << 10;
 const CR0_PE: usize = 1 << 0;
 
+#[derive(PartialEq, Eq, Debug)]
+enum VCPUType {
+    UnInitialized,
+    Host,
+    Guest,
+}
+
 /// A virtual CPU within a guest.
 #[repr(C)]
 pub struct VmxVcpu<H: AxVCpuHal> {
@@ -74,6 +82,9 @@ pub struct VmxVcpu<H: AxVCpuHal> {
     ept_root: Option<HostPhysAddr>,
 
     id: usize,
+    vcpu_type: VCPUType,
+
+    tsc_adjust: u64,
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
@@ -92,6 +103,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             entry: None,
             ept_root: None,
             id,
+            vcpu_type: VCPUType::UnInitialized,
+            tsc_adjust: 0,
         };
         debug!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr(),);
         Ok(vcpu)
@@ -428,7 +441,6 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn setup_msr_bitmap(&mut self) -> AxResult {
         // Intercept IA32_APIC_BASE MSR accesses
         // let msr = x86::msr::IA32_APIC_BASE;
@@ -442,6 +454,16 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             .set_write_intercept(IA32_UMWAIT_CONTROL, true);
         self.msr_bitmap
             .set_read_intercept(IA32_UMWAIT_CONTROL, true);
+
+        if self.vcpu_type == VCPUType::Guest {
+            // Intercept IA32_TSC_ADJUST MSR accesses for guest VCPU
+            self.msr_bitmap
+                .set_read_intercept(MSR_IA32_TSC_ADJUST, true);
+            self.msr_bitmap
+                .set_write_intercept(MSR_IA32_TSC_ADJUST, true);
+            // Intercept IA32_APICBASE MSR accesses
+            self.msr_bitmap.set_read_intercept(MSR_IA32_APICBASE, true);
+        }
 
         // Intercept all x2APIC MSR accesses
         // for msr in 0x800..=0x83f {
@@ -467,6 +489,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         match ctx {
             VCpuSetupContext::InitialBoot => {
+                self.vcpu_type = VCPUType::Guest;
                 self.setup_vmcs_guest(entry.ok_or_else(|| {
                     error!("VmxVcpu::setup_vmcs: entry is None");
                     ax_err_type!(InvalidInput)
@@ -474,10 +497,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             }
 
             VCpuSetupContext::HostContext(host_ctx) => {
+                self.vcpu_type = VCPUType::Host;
                 is_guest = false;
                 self.setup_vmcs_guest_from_ctx(host_ctx)?;
             }
             VCpuSetupContext::Linux64BitBoot(ctx) => {
+                self.vcpu_type = VCPUType::Guest;
                 is_guest = false;
                 self.setup_vmcs_guest_from_pvboot_ctx(ctx)?;
             }
@@ -533,10 +558,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// to avoid complexity and minimize the modification,
     /// we just keep them separated.
     fn setup_vmcs_guest_from_pvboot_ctx(&mut self, ctx: Linux64BitBootContext) -> AxResult {
-        warn!(
-            "VCpu[{}] setup_vmcs_guest_from_pvboot_ctx: {:#x?}",
-            self.id, ctx
-        );
+        // warn!(
+        //     "VCpu[{}] setup_vmcs_guest_from_pvboot_ctx: {:#x?}",
+        //     self.id, ctx
+        // );
 
         self.set_cr(0, ctx.cr0.bits());
         self.set_cr(4, ctx.cr4.bits());
@@ -600,6 +625,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         VmcsGuest64::IA32_PAT.write(ia32_pat)?;
         VmcsGuest64::IA32_EFER.write(ctx.efer.bits())?;
+
+        unsafe {
+            Msr::IA32_TSC_ADJUST.write(0);
+        }
 
         for msr_entry in ctx.msr_entries {
             match msr_entry.index {
@@ -890,6 +919,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let exception_bitmap: u32 = 1 << 6;
 
         self.setup_io_bitmap()?;
+        if self.vcpu_type == VCPUType::Guest {
+            self.setup_msr_bitmap()?;
+        }
 
         VmcsControl32::EXCEPTION_BITMAP.write(exception_bitmap)?;
         VmcsControl64::IO_BITMAP_A_ADDR.write(self.io_bitmap.phys_addr().0.as_usize() as _)?;
@@ -1151,6 +1183,77 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
+    fn handle_msr_write(&mut self, exit_info: &VmxExitInfo) -> AxResult {
+        let ecx = self.regs().rcx as u32;
+
+        match ecx {
+            MSR_IA32_TSC_ADJUST => {
+                let new_value = (self.regs().rdx << 32) | self.regs().rax;
+                self.tsc_adjust = new_value;
+                warn!(
+                    "VMX MSR-Write Exit: Set MSR_IA32_TSC_ADJUST to {:#x}",
+                    new_value
+                );
+            }
+            _ => {
+                return ax_err!(
+                    Unsupported,
+                    format_args!(
+                        "VMX unsupported MSR-Read Exit: MSR {:#x} of {:#x?}",
+                        ecx, exit_info
+                    )
+                );
+            }
+        }
+
+        self.advance_rip(exit_info.exit_instruction_length as _)?;
+
+        Ok(())
+    }
+
+    fn handle_msr_read(&mut self, exit_info: &VmxExitInfo) -> AxResult {
+        use crate::generated::msr_index::MSR_AMD64_DE_CFG;
+
+        let ecx = self.regs().rcx as u32;
+
+        match ecx {
+            MSR_AMD64_DE_CFG => {
+                // Just return 0 for `MSR_AMD64_DE_CFG`.
+                let msr_value = 0 as u64;
+                self.regs_mut().rax = msr_value as u64;
+                self.regs_mut().rdx = (msr_value >> 32) as u64;
+            }
+            MSR_IA32_APICBASE => {
+                let msr_value = Msr::IA32_APICBASE.read();
+
+                self.regs_mut().rax = msr_value as u64;
+                self.regs_mut().rdx = (msr_value >> 32) as u64;
+
+                info!("VMX MSR-Read Exit: MSR_IA32_APICBASE = {:#x}", msr_value);
+            }
+            MSR_IA32_TSC_ADJUST => {
+                let msr_value = self.tsc_adjust;
+                self.regs_mut().rax = msr_value as u64;
+                self.regs_mut().rdx = (msr_value >> 32) as u64;
+
+                info!("VMX MSR-Read Exit: MSR_IA32_TSC_ADJUST = {:#x}", msr_value);
+            }
+            _ => {
+                return ax_err!(
+                    Unsupported,
+                    format_args!(
+                        "VMX unsupported MSR-Read Exit: MSR {:#x} of {:#x?}",
+                        ecx, exit_info
+                    )
+                );
+            }
+        }
+
+        self.advance_rip(exit_info.exit_instruction_length as _)?;
+
+        Ok(())
+    }
+
     /// Handle vm-exits than can and should be handled by [`VmxVcpu`] itself.
     ///
     /// Return the result or None if the vm-exit was not handled.
@@ -1166,6 +1269,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             VmxExitReason::CR_ACCESS => Some(self.handle_cr()),
             VmxExitReason::CPUID => Some(self.handle_cpuid()),
             VmxExitReason::EXCEPTION_NMI => Some(self.handle_exception_nmi(exit_info)),
+            VmxExitReason::MSR_READ => Some(self.handle_msr_read(exit_info)),
+            VmxExitReason::MSR_WRITE => Some(self.handle_msr_write(exit_info)),
             _ => None,
         }
     }
@@ -1254,7 +1359,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         const EAX_FREQUENCY_INFO: u32 = 0x16;
         const LEAF_HYPERVISOR_INFO: u32 = 0x4000_0000;
         const LEAF_HYPERVISOR_FEATURE: u32 = 0x4000_0001;
-        const VENDOR_STR: &[u8; 12] = b"AXHYPERVISOR";
+        const VENDOR_STR: &[u8; 12] = b"EQHYPERVISOR";
         let vendor_regs = unsafe { &*(VENDOR_STR.as_ptr() as *const [u32; 3]) };
 
         let regs_clone = self.regs_mut().clone();
@@ -1317,10 +1422,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
         };
 
-        trace!(
-            "VM exit: CPUID({:#x}, {:#x}): {:?}",
-            regs_clone.rax, regs_clone.rcx, res
-        );
+        // trace!(
+        //     "VM exit: CPUID({:#x}, {:#x}): {:?}",
+        //     regs_clone.rax, regs_clone.rcx, res
+        // );
 
         let regs = self.regs_mut();
         regs.rax = res.eax as _;
@@ -1671,6 +1776,12 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                     }
                     _ => {
                         warn!("VMX unsupported VM-Exit: {:#x?}", exit_info);
+
+                        self.decode_instruction(
+                            GuestVirtAddr::from_usize(exit_info.guest_rip),
+                            exit_info.exit_instruction_length as _,
+                        )?;
+
                         warn!("VCpu {:#x?}", self);
                         AxVCpuExitReason::Halt
                     }
