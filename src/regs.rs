@@ -78,6 +78,11 @@ impl GeneralRegisters {
                 self.rbp = ctx.rbp;
                 self.rsi = ctx.rsi;
             }
+            VCpuSetupContext::ParavirtBoot(ctx) => {
+                self.rbp = ctx.rbp;
+                self.rsi = ctx.rsi;
+                self.rdi = ctx.rdi;
+            }
             _ => {
                 warn!(
                     "Unsupported VCpuSetupContext {:?} in load_from_context",
