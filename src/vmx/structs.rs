@@ -240,18 +240,45 @@ impl FeatureControl {
 /// EPTP list, the 4-KByte structure,
 /// The EPTP list comprises 512 8-Byte entries (each an EPTP value)
 /// and is used by the EPTP-switching VM function (see Section 26.5.6.3).
+///
+/// # VMFUNC EPTP Switching
+///
+/// When VMFUNC with EAX=0 (EPTP switching) is executed:
+/// 1. The CPU reads ECX to get the target EPTP index
+/// 2. If index is valid (< 512) and EPTP entry is valid, switch to new EPT
+/// 3. Otherwise, VM exit with VMFUNC exit reason
+///
+/// # EPTP Entry Format
+///
+/// Each entry is a 64-bit EPT Pointer (EPTP) with format:
+/// - Bits 2:0: Memory type (0=UC, 6=WB)
+/// - Bits 5:3: EPT page-walk length minus 1 (typically 3 for 4-level)
+/// - Bit 6: Enable accessed and dirty flags
+/// - Bits N-1:12: Physical address of EPT PML4 table (4KB aligned)
 pub(super) struct EptpList<H: AxVCpuHal> {
-    frame: PhysFrame<H>,
+    frame: Option<PhysFrame<H>>,
+    base_hpa: HostPhysAddr,
 }
 
 impl<H: AxVCpuHal> EptpList<H> {
+    /// Create a new EPTP list region, allocating a new frame.
     pub fn new() -> AxResult<Self> {
+        let init_frame = PhysFrame::alloc_zero()?;
         Ok(Self {
-            frame: PhysFrame::alloc_zero()?,
+            base_hpa: init_frame.start_paddr(),
+            frame: Some(init_frame),
         })
     }
 
+    /// Get the physical address of the EPTP list.
     pub fn phys_addr(&self) -> HostPhysAddr {
-        self.frame.start_paddr()
+        self.base_hpa
+    }
+
+    /// Re-initialize the EPTP list to point to a new physical address.
+    pub fn reinit(&mut self, hpa: HostPhysAddr) -> AxResult {
+        self.frame = None;
+        self.base_hpa = hpa;
+        Ok(())
     }
 }
