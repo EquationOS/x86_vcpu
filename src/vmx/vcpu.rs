@@ -2018,6 +2018,23 @@ impl<H: AxVCpuHal> AxVcpuAccessGuestState for VmxVcpu<H> {
         self.eptp_list.phys_addr()
     }
 
+    fn set_eptp_list_region(&mut self, addr: HostPhysAddr) -> AxResult {
+        let vmfunc_control = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
+
+        if vmfunc_control & 0b1 != 0 {
+            error!("vCPU {} VMFUNC is not enabled, re-enable it", self.id);
+            VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
+        }
+
+        self.eptp_list.reinit(addr)?;
+
+        VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
+
+        warn!("vCPU {} reset EPTP_LIST_ADDR to {:?}", self.id, addr);
+
+        Ok(())
+    }
+
     fn dump(&self) {
         warn!("Dumping VmxVcpu {:#x?}", self);
     }
