@@ -92,6 +92,10 @@ pub enum VmcsControl16 {
     POSTED_INTERRUPT_NOTIFICATION_VECTOR = 0x2,
     /// EPTP index.
     EPTP_INDEX = 0x4,
+    /// HLAT prefix size
+    HLAT_PREFIX_SIZE = 0x6,
+    /// Last PID-pointer index
+    LAST_PID_POINTER_INDEX = 0x8,
 }
 define_vmcs_fields_rw!(VmcsControl16, u16);
 
@@ -150,6 +154,36 @@ pub enum VmcsControl64 {
     SUBPAGE_PERM_TABLE_PTR = 0x2030,
     /// TSC multiplier (full).
     TSC_MULTIPLIER = 0x2032,
+    /// Tertiary processor-based VM-execution controls (full).
+    /// This field exists only on processors that support the 1-setting of the “activate tertiary controls” VM-execution control.
+    TERTIARY_PROCBASED_EXEC_CONTROLS = 0x2034,
+    /// Low PASID directory address (full).
+    /// This field exists only on processors that support the 1-setting of the “PASID translation” VM-execution control.
+    LOW_PASID_DIR_ADDR = 0x2038,
+    /// High PASID directory address (full).
+    /// This field exists only on processors that support the 1-setting of the “PASID translation” VM-execution control.
+    HIGH_PASID_DIR_ADDR = 0x203A,
+    /// SEAM shared EPT pointer (full).
+    /// This field exists only on processors that support the 1-setting of the “SEAM guest-physical address width” VM-execution control.
+    SEAM_SHARED_EPTP = 0x203C,
+    /// PCONFIG-exiting bitmap (full).
+    /// This field exists only on processors that support the 1-setting of the “enable PCONFIG” VM-execution control.
+    PCONFIG_EXITING_BITMAP = 0x203E,
+    /// Hypervisor-managed linear-address translation pointer (HLATP; full).
+    /// This field exists only on processors that support the 1-setting of the “enable HLAT” VM-execution control.
+    HLATP = 0x2040,
+    /// PID-pointer table address (full).
+    /// This field exists only on processors that support the 1-setting of the “IPI virtualization” VM-execution control.
+    PID_POINTER_TABLE_ADDR = 0x2042,
+    /// Secondary VM-exit controls (full).
+    /// This field exists only on processors that support the 1-setting of the “activate secondary controls” VM-exit control.
+    SECONDARY_VMEXIT_CONTROLS = 0x2044,
+    /// IA32_SPEC_CTRL mask (full).
+    /// This field exists only on processors that support the 1-setting of the “virtualize IA32_SPEC_CTRL” VM-execution control
+    IA32_SPEC_CTRL_MASK = 0x204A,
+    /// IA32_SPEC_CTRL shadow (full).
+    /// This field exists only on processors that support the 1-setting of the “virtualize IA32_SPEC_CTRL” VM-execution control
+    IA32_SPEC_CTRL_SHADOW = 0x204C,
 }
 define_vmcs_fields_rw!(VmcsControl64, u64);
 
@@ -584,7 +618,9 @@ pub struct CrAccessInfo {
 
 pub mod controls {
     pub use x86::vmx::vmcs::control::{EntryControls, ExitControls};
-    pub use x86::vmx::vmcs::control::{PinbasedControls, PrimaryControls, SecondaryControls};
+    pub use x86::vmx::vmcs::control::{
+        PinbasedControls, PrimaryControls, SecondaryControls, TertiaryControls,
+    };
 }
 
 pub fn set_control(
@@ -628,6 +664,43 @@ pub fn set_control(
     let default = unknown & old_value; // these bits keep unchanged in old value
     let fixed1 = allowed0; // these bits are fixed to 1
     control.write(fixed1 | default | set)?;
+    Ok(())
+}
+
+pub fn set_control64(
+    control: VmcsControl64,
+    capability_msr: Msr,
+    old_value: u64,
+    set: u64,
+    clear: u64,
+) -> AxResult {
+    let cap = capability_msr.read();
+    // For IA32_VMX_PROCBASED_CTLS3, the MSR directly reports allowed 1-settings
+    // (no allowed0/allowed1 split like other control MSRs)
+    let allowed1 = cap;
+
+    trace!(
+        "set_control64 {:?}: cap {:#x} {:#x} (+{:#x}, -{:#x})",
+        control, cap, old_value, set, clear
+    );
+
+    if (set & clear) != 0 {
+        return ax_err!(
+            InvalidInput,
+            format_args!("can not set and clear the same bit in {:?}", control)
+        );
+    }
+    if (allowed1 & set) != set {
+        // failed if set bits not allowed in allowed1
+        return ax_err!(
+            Unsupported,
+            format_args!("can not set bits {:#x} in {:?}", set, control)
+        );
+    }
+    // For tertiary controls: only allowed1 bits can be set to 1
+    // All other bits must be 0
+    let value = (old_value | set) & !clear;
+    control.write(value)?;
     Ok(())
 }
 

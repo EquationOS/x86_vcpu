@@ -8,10 +8,11 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use axaddrspace::{GuestPhysAddr, HostPhysAddr};
 use core::mem;
 
-use x86::segmentation::SegmentSelector;
 use x86::Ring;
+use x86::segmentation::SegmentSelector;
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr0Flags, Cr4Flags, EferFlags};
 use x86_64::structures::DescriptorTablePointer;
@@ -292,18 +293,22 @@ pub fn create_boot_msr_entries() -> Vec<MsrEntry> {
 /// - 15: CPUNODE
 pub fn create_linux_final_gdt() -> [u64; LINUX_GDT_ENTRIES] {
     [
-        gdt_entry(0, 0, 0),                // 0: NULL
-        gdt_entry(0xcf9b, 0, 0xfffff),     // 1: KERNEL32_CS (32-bit code)
-        gdt_entry(0xaf9b, 0, 0xfffff),     // 2: KERNEL_CS (64-bit code)
-        gdt_entry(0xcf93, 0, 0xfffff),     // 3: KERNEL_DS (data)
-        gdt_entry(0xcffb, 0, 0xfffff),     // 4: USER32_CS (32-bit user code)
-        gdt_entry(0xcff3, 0, 0xfffff),     // 5: USER_DS (user data)
-        gdt_entry(0xaffb, 0, 0xfffff),     // 6: USER_CS (64-bit user code)
-        0,                                  // 7: Reserved
-        0, 0,                               // 8-9: TSS (filled at runtime)
-        0, 0,                               // 10-11: LDT
-        0, 0, 0,                            // 12-14: TLS
-        0,                                  // 15: CPUNODE
+        gdt_entry(0, 0, 0),            // 0: NULL
+        gdt_entry(0xcf9b, 0, 0xfffff), // 1: KERNEL32_CS (32-bit code)
+        gdt_entry(0xaf9b, 0, 0xfffff), // 2: KERNEL_CS (64-bit code)
+        gdt_entry(0xcf93, 0, 0xfffff), // 3: KERNEL_DS (data)
+        gdt_entry(0xcffb, 0, 0xfffff), // 4: USER32_CS (32-bit user code)
+        gdt_entry(0xcff3, 0, 0xfffff), // 5: USER_DS (user data)
+        gdt_entry(0xaffb, 0, 0xfffff), // 6: USER_CS (64-bit user code)
+        0,                             // 7: Reserved
+        0,
+        0, // 8-9: TSS (filled at runtime)
+        0,
+        0, // 10-11: LDT
+        0,
+        0,
+        0, // 12-14: TLS
+        0, // 15: CPUNODE
     ]
 }
 
@@ -320,16 +325,16 @@ pub fn create_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     // TSS descriptor type: 0x89 (64-bit TSS, available)
     let type_attr: u64 = 0x89;
     let present: u64 = 1 << 47;
-    
+
     let low = (limit as u64 & 0xFFFF)
         | ((base & 0xFFFFFF) << 16)
         | (type_attr << 40)
         | present
         | (((limit as u64 >> 16) & 0xF) << 48)
         | ((base & 0xFF00_0000) << 32);
-    
+
     let high = base >> 32;
-    
+
     (low, high)
 }
 
@@ -380,17 +385,17 @@ pub struct PvSharedInfo {
     pub max_vcpus: u32,
     /// Currently online vCPUs
     pub online_vcpus: u32,
-    
+
     /// EPTP index for this Linux guest (in EPTP list)
     pub guest_eptp_index: u32,
     /// EPTP index for MicroVM Gate (for returning to Gate)
     pub gate_eptp_index: u32,
-    
+
     /// Flags (see PV_SHARED_FLAG_* constants)
     pub flags: u32,
     /// Reserved for alignment
     pub _reserved1: u32,
-    
+
     /// Guest virtual address of the shared GDT
     pub gdt_vaddr: u64,
     /// Guest virtual address of the shared IDT
@@ -399,7 +404,7 @@ pub struct PvSharedInfo {
     pub tss_vaddr: u64,
     /// Guest physical address of boot_params (zero page)
     pub boot_params_gpa: u64,
-    
+
     /// Linux kernel entry point virtual address
     pub linux_entry: u64,
     /// Linux CR3 (page table root physical address)
@@ -408,10 +413,10 @@ pub struct PvSharedInfo {
     pub linux_rsp: u64,
     /// Linux kernel command line physical address
     pub cmdline_gpa: u64,
-    
+
     /// Per-vCPU information array
     pub vcpu_info: [PvVcpuInfo; 32],
-    
+
     /// Reserved space for future extensions
     pub _reserved2: [u64; 32],
 }
@@ -436,9 +441,9 @@ impl Default for PvSharedInfo {
             online_vcpus: 0,
             guest_eptp_index: LINUX_EPTP_INDEX_BASE,
             gate_eptp_index: GATE_EPTP_INDEX,
-            flags: PV_SHARED_FLAG_SKIP_GDT_INIT 
-                 | PV_SHARED_FLAG_SKIP_IDT_INIT 
-                 | PV_SHARED_FLAG_SKIP_TSS_INIT,
+            flags: PV_SHARED_FLAG_SKIP_GDT_INIT
+                | PV_SHARED_FLAG_SKIP_IDT_INIT
+                | PV_SHARED_FLAG_SKIP_TSS_INIT,
             _reserved1: 0,
             gdt_vaddr: 0,
             idt_vaddr: 0,
@@ -459,17 +464,17 @@ impl PvSharedInfo {
     pub fn is_valid(&self) -> bool {
         self.magic == PV_SHARED_INFO_MAGIC && self.version == PV_SHARED_INFO_VERSION
     }
-    
+
     /// Check if a specific flag is set.
     pub fn has_flag(&self, flag: u32) -> bool {
         self.flags & flag != 0
     }
-    
+
     /// Set a flag.
     pub fn set_flag(&mut self, flag: u32) {
         self.flags |= flag;
     }
-    
+
     /// Clear a flag.
     pub fn clear_flag(&mut self, flag: u32) {
         self.flags &= !flag;
@@ -494,8 +499,8 @@ pub struct ParavirtBootContext {
     pub rsp: u64,
     pub rip: u64,
     pub rbp: u64,
-    pub rsi: u64,  // Pointer to boot_params
-    pub rdi: u64,  // CPU ID (for AP boot)
+    pub rsi: u64, // Pointer to boot_params
+    pub rdi: u64, // CPU ID (for AP boot)
     pub rflags: u64,
 
     // ============ Segment Registers (Linux final layout) ============
@@ -525,10 +530,10 @@ pub struct ParavirtBootContext {
     pub mxcsr: u32,
 
     // ============ Paravirt-specific ============
-    /// Guest's EPTP index in the EPTP list
-    pub eptp_index: u32,
-    /// Address of PvSharedInfo structure
-    pub shared_info_gpa: u64,
+    /// per-vCPU EPTP list region base address.
+    pub eptp_list_region_base: HostPhysAddr,
+    /// Guest physical address of HLATP.
+    pub hlat_ptr: GuestPhysAddr,
 }
 
 impl core::fmt::Debug for ParavirtBootContext {
@@ -543,14 +548,28 @@ impl core::fmt::Debug for ParavirtBootContext {
         writeln!(f, "  cs: {} (selector={:#x})", self.cs, self.cs.selector)?;
         writeln!(f, "  ds: {} (selector={:#x})", self.ds, self.ds.selector)?;
         writeln!(f, "  ss: {} (selector={:#x})", self.ss, self.ss.selector)?;
-        writeln!(f, "  gdt: base={:#x}, limit={:#x}", self.gdt.base.as_u64(), self.gdt.limit)?;
-        writeln!(f, "  idt: base={:#x}, limit={:#x}", self.idt.base.as_u64(), self.idt.limit)?;
+        writeln!(
+            f,
+            "  gdt: base={:#x}, limit={:#x}",
+            self.gdt.base.as_u64(),
+            self.gdt.limit
+        )?;
+        writeln!(
+            f,
+            "  idt: base={:#x}, limit={:#x}",
+            self.idt.base.as_u64(),
+            self.idt.limit
+        )?;
         writeln!(f, "  cr0: {:#x} {:?}", self.cr0.bits(), self.cr0)?;
         writeln!(f, "  cr3: {:#x}", self.cr3)?;
         writeln!(f, "  cr4: {:?}", self.cr4)?;
         writeln!(f, "  efer: {:?}", self.efer)?;
-        writeln!(f, "  eptp_index: {}", self.eptp_index)?;
-        writeln!(f, "  shared_info_gpa: {:#x}", self.shared_info_gpa)?;
+        writeln!(
+            f,
+            "  eptp_list_region_base: {:?}",
+            self.eptp_list_region_base
+        )?;
+        writeln!(f, "  hlat_ptr: {:?}", self.hlat_ptr)?;
         writeln!(f, "}}")
     }
 }
@@ -559,28 +578,28 @@ impl Default for ParavirtBootContext {
     fn default() -> Self {
         // Create Linux's final GDT
         let gdt_table = create_linux_final_gdt();
-        
+
         // Create segment descriptors using Linux's final selector values
-        let code_seg = Segment::from_raw_entry_value(gdt_table[2], 2);  // KERNEL_CS = 0x10
-        let data_seg = Segment::from_raw_entry_value(gdt_table[3], 3);  // KERNEL_DS = 0x18
-        
+        let code_seg = Segment::from_raw_entry_value(gdt_table[2], 2); // KERNEL_CS = 0x10
+        let data_seg = Segment::from_raw_entry_value(gdt_table[3], 3); // KERNEL_DS = 0x18
+
         // TSS segment (will be properly initialized by Gate)
         // TSS selector = 0x40 = entry 8 in GDT
         let tss_seg = Segment {
             selector: SegmentSelector::new(8, Ring::Ring0),
             base: PV_SHARED_TSS_GPA,
-            limit: 0x67,  // Minimum TSS size
-            access_rights: SegmentAccessRights::from_bits_truncate(0x8b),  // 64-bit TSS
+            limit: 0x67, // Minimum TSS size
+            access_rights: SegmentAccessRights::from_bits_truncate(0x8b), // 64-bit TSS
         };
 
         Self {
             rsp: BOOT_STACK_POINTER,
             rip: 0,
             rbp: 0,
-            rsi: ZERO_PAGE_START,  // boot_params pointer
-            rdi: 0,                 // CPU ID
+            rsi: ZERO_PAGE_START, // boot_params pointer
+            rdi: 0,               // CPU ID
             rflags: BOOT_RFLAGS,
-            
+
             // Use Linux's final segment layout
             cs: code_seg,
             ds: data_seg.clone(),
@@ -589,26 +608,26 @@ impl Default for ParavirtBootContext {
                 selector: SegmentSelector::from_raw(0),
                 base: 0,
                 limit: 0,
-                access_rights: SegmentAccessRights::from_bits_truncate(0x10000),  // Unusable
+                access_rights: SegmentAccessRights::from_bits_truncate(0x10000), // Unusable
             },
             gs: Segment {
                 selector: SegmentSelector::from_raw(0),
                 base: 0,
                 limit: 0,
-                access_rights: SegmentAccessRights::from_bits_truncate(0x10000),  // Unusable
+                access_rights: SegmentAccessRights::from_bits_truncate(0x10000), // Unusable
             },
             ss: data_seg,
             tss: tss_seg,
-            
+
             gdt: DescriptorTablePointer {
                 limit: (LINUX_GDT_ENTRIES * 8 - 1) as u16,
                 base: VirtAddr::new(PV_SHARED_GDT_GPA),
             },
             idt: DescriptorTablePointer {
-                limit: 256 * 16 - 1,  // 256 entries, 16 bytes each
+                limit: 256 * 16 - 1, // 256 entries, 16 bytes each
                 base: VirtAddr::new(PV_SHARED_IDT_GPA),
             },
-            
+
             // Control registers with optimal settings
             cr0: Cr0Flags::PROTECTED_MODE_ENABLE
                 | Cr0Flags::EXTENSION_TYPE
@@ -624,14 +643,14 @@ impl Default for ParavirtBootContext {
                 | EferFlags::LONG_MODE_ACTIVE
                 | EferFlags::SYSTEM_CALL_EXTENSIONS
                 | EferFlags::NO_EXECUTE_ENABLE,
-            
+
             msr_entries: create_paravirt_msr_entries(),
-            
+
             fcw: 0x37f,
             mxcsr: 0x1f80,
-            
-            eptp_index: LINUX_EPTP_INDEX_BASE,
-            shared_info_gpa: PV_SHARED_INFO_GPA,
+
+            eptp_list_region_base: HostPhysAddr::from_usize(0x0),
+            hlat_ptr: GuestPhysAddr::from_usize(0x0),
         }
     }
 }
@@ -641,40 +660,45 @@ impl ParavirtBootContext {
     pub fn set_rip(&mut self, rip: u64) {
         self.rip = rip;
     }
-    
+
     /// Set the page table root (CR3).
     pub fn set_cr3(&mut self, cr3: u64) {
         self.cr3 = cr3;
     }
-    
+
     /// Set the CPU ID (passed in RDI).
     pub fn set_cpu_id(&mut self, cpu_id: u64) {
         self.rdi = cpu_id;
     }
-    
-    /// Set the EPTP index for this guest.
-    pub fn set_eptp_index(&mut self, index: u32) {
-        self.eptp_index = index;
-    }
-    
+
     /// Set GS base for per-CPU data.
     pub fn set_gs_base(&mut self, base: u64) {
         self.gs.base = base;
     }
-    
+
     /// Set the GDT base address.
     pub fn set_gdt_base(&mut self, base: u64) {
         self.gdt.base = VirtAddr::new(base);
     }
-    
+
     /// Set the IDT base address.
     pub fn set_idt_base(&mut self, base: u64) {
         self.idt.base = VirtAddr::new(base);
     }
-    
+
     /// Set the TSS base address.
     pub fn set_tss_base(&mut self, base: u64) {
         self.tss.base = base;
+    }
+
+    /// Set the EPTP list region base address.
+    pub fn set_eptp_list_region_base(&mut self, base: HostPhysAddr) {
+        self.eptp_list_region_base = base;
+    }
+
+    /// Set the HLATP guest physical address.
+    pub fn set_hlat_ptr(&mut self, ptr: GuestPhysAddr) {
+        self.hlat_ptr = ptr;
     }
 }
 
@@ -691,7 +715,6 @@ pub fn create_paravirt_msr_entries() -> Vec<MsrEntry> {
         msr_entry_default(Msr::IA32_SYSENTER_CS),
         msr_entry_default(Msr::IA32_SYSENTER_ESP),
         msr_entry_default(Msr::IA32_SYSENTER_EIP),
-        
         // SYSCALL/SYSRET MSRs
         MsrEntry {
             index: Msr::STAR,
@@ -699,26 +722,22 @@ pub fn create_paravirt_msr_entries() -> Vec<MsrEntry> {
             // STAR[31:16] = SYSCALL CS selector (KERNEL_CS)
             data: ((USER32_CS as u64) << 48) | ((KERNEL_CS as u64) << 32),
         },
-        msr_entry_default(Msr::LSTAR),   // SYSCALL target address (set by Linux)
-        msr_entry_default(Msr::CSTAR),   // Compat SYSCALL target (set by Linux)
+        msr_entry_default(Msr::LSTAR), // SYSCALL target address (set by Linux)
+        msr_entry_default(Msr::CSTAR), // Compat SYSCALL target (set by Linux)
         MsrEntry {
             index: Msr::SYSCALL_MASK,
             // Flags to clear on syscall
-            data: 0x4700,  // Clear TF, IF, DF, AC, NT
+            data: 0x4700, // Clear TF, IF, DF, AC, NT
         },
-        
         // Kernel GS base (used with swapgs)
         msr_entry_default(Msr::KERNEL_GSBASE),
-        
         // TSC
         msr_entry_default(Msr::IA32_TSC),
-        
         // Misc enable
         MsrEntry {
             index: Msr::IA32_MISC_ENABLE,
             data: u64::from(MSR_IA32_MISC_ENABLE_FAST_STRING),
         },
-        
         // MTRR default type: write-back
         MsrEntry {
             index: Msr::MTRR_DEF_TYPE,

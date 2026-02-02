@@ -2,6 +2,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
 use core::{arch::naked_asm, mem::size_of};
+use memory_addr::MemoryAddr;
 
 use bit_field::BitField;
 use raw_cpuid::CpuId;
@@ -60,6 +61,7 @@ enum VCPUType {
     UnInitialized,
     Host,
     Guest,
+    EqParavirtGuest,
 }
 
 /// A virtual CPU within a guest.
@@ -479,8 +481,6 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         entry: Option<GuestPhysAddr>,
         ctx: VCpuSetupContext,
     ) -> AxResult {
-        let mut is_guest = true;
-
         let paddr = self.vmcs.phys_addr().as_usize() as u64;
         unsafe {
             vmx::vmclear(paddr).map_err(as_axerr)?;
@@ -498,24 +498,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
             VCpuSetupContext::HostContext(host_ctx) => {
                 self.vcpu_type = VCPUType::Host;
-                is_guest = false;
                 self.setup_vmcs_guest_from_ctx(host_ctx)?;
             }
             VCpuSetupContext::Linux64BitBoot(ctx) => {
-                self.vcpu_type = VCPUType::Guest;
-                is_guest = false;
+                self.vcpu_type = VCPUType::EqParavirtGuest;
                 self.setup_vmcs_guest_from_pvboot_ctx(ctx)?;
             }
             VCpuSetupContext::ParavirtBoot(ctx) => {
                 // Paravirt boot uses similar setup to Linux64BitBoot
                 // but with Linux's final GDT layout
-                self.vcpu_type = VCPUType::Guest;
-                is_guest = false;
+                self.vcpu_type = VCPUType::EqParavirtGuest;
                 self.setup_vmcs_guest_from_paravirt_ctx(ctx)?;
             }
         }
 
-        self.setup_vmcs_control(ept_root, is_guest)?;
+        self.setup_vmcs_control(ept_root)?;
+
         self.set_vpid(self.id as u16 + 1)?;
         self.unbind_from_current_processor()?;
         Ok(())
@@ -797,6 +795,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             }
         }
 
+        // Setup some VMCS controls fields required by Linux paravirt boot
+        self.set_eptp_list_region(ctx.eptp_list_region_base)?;
+        self.set_hlat_pointer(ctx.hlat_ptr)?;
+
         Ok(())
     }
 
@@ -919,7 +921,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
-    fn setup_vmcs_control(&mut self, ept_root: HostPhysAddr, is_guest: bool) -> AxResult {
+    fn setup_vmcs_control(&mut self, ept_root: HostPhysAddr) -> AxResult {
         // Intercept NMI and external interrupts.
         use super::vmcs::controls::*;
         use PinbasedControls as PinCtrl;
@@ -932,7 +934,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             // (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
             // (PinCtrl::NMI_EXITING | PinCtrl::VMX_PREEMPTION_TIMER).bits(),
             // PinCtrl::NMI_EXITING.bits(),
-            if is_guest {
+            if self.vcpu_type != VCPUType::Host {
                 PinCtrl::NMI_EXITING.bits()
             } else {
                 0 // Do not intercept NMI in for host VM now.
@@ -943,12 +945,16 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
         // disable CR3 load/store interception.
         use PrimaryControls as CpuCtrl;
+        let mut val =
+            CpuCtrl::USE_IO_BITMAPS | CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS;
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            val |= CpuCtrl::TERTIARY_CONTROLS;
+        }
         vmcs::set_control(
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
             Msr::IA32_VMX_PROCBASED_CTLS.read() as u32,
-            (CpuCtrl::USE_IO_BITMAPS | CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS)
-                .bits(),
+            val.bits(),
             (CpuCtrl::CR3_LOAD_EXITING
                 | CpuCtrl::CR3_STORE_EXITING
                 | CpuCtrl::CR8_LOAD_EXITING
@@ -993,6 +999,27 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             0,
         )?;
 
+        // Set tertiary processor-based controls.
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            use TertiaryControls as CpuCtrl3;
+
+            // Enable HLAT paging for paravirtualized guest.
+            let val = CpuCtrl3::ENABLE_HLAT;
+
+            // The IA32_VMX_PROCBASED_CTLS3 MSR exists only on processors
+            // that support the 1-setting of the “activate tertiary controls”
+            // VM-execution control (only if bit 49 of the IA32_VMX_PROCBASED_CTLS MSR is 1).
+            vmcs::set_control64(
+                VmcsControl64::TERTIARY_PROCBASED_EXEC_CONTROLS,
+                Msr::IA32_VMX_PROCBASED_CTLS3,
+                0,
+                val.bits(),
+                0,
+            )?;
+
+            self.set_hlat_prefix_size()?;
+        }
+
         // Switch to 64-bit host, acknowledge interrupt info, switch IA32_PAT/IA32_EFER on VM exit.
         use ExitControls as ExitCtrl;
         vmcs::set_control(
@@ -1011,7 +1038,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         let mut val = EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER;
 
-        if !is_guest {
+        if self.vcpu_type != VCPUType::Guest {
             // IA-32e mode guest
             // On processors that support Intel 64 architecture, this control determines whether the logical processor is in IA-32e mode after VM entry.
             // Its value is loaded into IA32_EFER.LMA as part of VM entry.
@@ -1037,18 +1064,30 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         VmcsControl32::CR3_TARGET_COUNT.write(0)?;
 
-        // 25.6.14 VM-Function Controls
-        // Table 25-10. Definitions of VM-Function Controls
-        // Bit 0: EPTP switching
-        VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
-
-        VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
+        if self.vcpu_type != VCPUType::EqParavirtGuest {
+            // 25.6.14 VM-Function Controls
+            // Table 25-10. Definitions of VM-Function Controls
+            // Bit 0: EPTP switching
+            VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
+            VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
+        } else {
+            // Just do a double check here.
+            let vmfunc_control = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
+            if vmfunc_control & 0b1 == 0 {
+                warn!(
+                    "VCpu {}: EPTP switching is not enabled in VM_FUNCTION_CONTROLS",
+                    self.id
+                );
+                VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
+                VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
+            }
+        }
 
         // Pass-through exceptions (except #UD(6)), don't use I/O bitmap, set MSR bitmaps.
         let exception_bitmap: u32 = 1 << 6;
 
         self.setup_io_bitmap()?;
-        if self.vcpu_type == VCPUType::Guest {
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
             self.setup_msr_bitmap()?;
         }
 
@@ -1064,6 +1103,75 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             return ax_err!(InvalidInput);
         }
         VmcsControl16::VPID.write(vpid)?;
+        Ok(())
+    }
+
+    fn set_eptp_list_region(&mut self, addr: HostPhysAddr) -> AxResult {
+        let vmfunc_control = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
+
+        if vmfunc_control & 0b1 == 0 {
+            VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
+        }
+
+        self.eptp_list.reinit(addr)?;
+
+        VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
+
+        info!("vCPU {} set EPTP_LIST_ADDR to {:?}", self.id, addr);
+
+        Ok(())
+    }
+
+    fn set_hlat_pointer(&mut self, hlat_ptr: GuestPhysAddr) -> AxResult {
+        // The hypervisor-managed linear-address translation pointer (HLAT pointer or HLATP)
+        // is used by HLAT paging to locate and access the first paging structure used for
+        // linear-address translation (see SDM. Section 5.5).
+        // The format of this field is shown in Table 26-12.
+        // Table 26-12. Format of Hypervisor-Managed Linear-Address Translation Pointer
+        // Bit Position(s) Field
+        // 2:0: Reserved
+        // 3 (PWT) Page-level write-through; indirectly determines the memory type used to access the first HLAT paging structure
+        // during linear-address translation.
+        // 4 (PCD) Page-level cache disable; indirectly determines the memory type used to access the first HLAT paging structure
+        // during linear-address translation.
+        // 11:5 Reserved
+        // M–1:12 Guest-physical address (4KB-aligned) of the first HLAT paging structure during linear-address translation.
+        // 63:M Reserved
+        if !hlat_ptr.is_aligned_4k() {
+            return ax_err!(
+                InvalidInput,
+                format_args!("HLAT pointer {:#x} is not 4KB-aligned", hlat_ptr.as_usize())
+            );
+        }
+        VmcsControl64::HLATP.write(hlat_ptr.as_usize() as _)?;
+
+        info!("vCPU {} sets HLATP to {:?}", self.id, hlat_ptr);
+
+        Ok(())
+    }
+
+    fn set_hlat_prefix_size(&mut self) -> AxResult {
+        // According to SDM Vol. 3C, Section 5.5.1 Ordinary Paging and HLAT Paging
+        // This behavior applies if the CPU enumerates a maximum HLAT prefix size
+        // of 1 in IA32_VMX_EPT_VPID_CAP[53:48] (see AppendixA.10).
+        // Behavior when a different value is enumerated is not currently defined.
+        let hlat_prefix_size_cap = (Msr::IA32_VMX_EPT_VPID_CAP.read() >> 48) & 0x3f;
+
+        // Bits 53:48 enumerate the maximum HLAT prefix size.
+        // It is expected that any processor that supports the 1-setting
+        // of the “enable HLAT” VM-execution control will enumerate this value as 1.
+        if hlat_prefix_size_cap != 1 {
+            // HLAT prefix size not supported
+            return ax_err!(
+                Unsupported,
+                format_args!(
+                    "HLAT prefix size not supported, get maximum HLAT prefix size {}",
+                    hlat_prefix_size_cap
+                )
+            );
+        }
+
+        VmcsControl16::HLAT_PREFIX_SIZE.write(hlat_prefix_size_cap as u16)?;
         Ok(())
     }
 
@@ -2016,23 +2124,6 @@ impl<H: AxVCpuHal> AxVcpuAccessGuestState for VmxVcpu<H> {
 
     fn eptp_list_region(&self) -> HostPhysAddr {
         self.eptp_list.phys_addr()
-    }
-
-    fn set_eptp_list_region(&mut self, addr: HostPhysAddr) -> AxResult {
-        let vmfunc_control = VmcsControl64::VM_FUNCTION_CONTROLS.read()?;
-
-        if vmfunc_control & 0b1 != 0 {
-            error!("vCPU {} VMFUNC is not enabled, re-enable it", self.id);
-            VmcsControl64::VM_FUNCTION_CONTROLS.write(0b1)?;
-        }
-
-        self.eptp_list.reinit(addr)?;
-
-        VmcsControl64::EPTP_LIST_ADDR.write(self.eptp_list.phys_addr().as_usize() as _)?;
-
-        warn!("vCPU {} reset EPTP_LIST_ADDR to {:?}", self.id, addr);
-
-        Ok(())
     }
 
     fn dump(&self) {
