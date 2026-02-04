@@ -42,7 +42,7 @@ pub struct GeneralRegisters {
 }
 
 impl GeneralRegisters {
-    pub fn from_context(context: &crate::context::LinuxContext) -> Self {
+    pub fn from_context(context: &crate::context::GuestContext) -> Self {
         Self {
             rax: 0,
             rbx: context.rbx,
@@ -55,15 +55,6 @@ impl GeneralRegisters {
         }
     }
 
-    // pub fn load_from_context(&mut self, context: &crate::context::LinuxContext) {
-    //     self.rbx = context.rbx;
-    //     self.rbp = context.rbp;
-    //     self.r12 = context.r12;
-    //     self.r13 = context.r13;
-    //     self.r14 = context.r14;
-    //     self.r15 = context.r15;
-    // }
-
     pub fn load_from_context(&mut self, context: &VCpuSetupContext) {
         match context {
             VCpuSetupContext::HostContext(ctx) => {
@@ -74,11 +65,7 @@ impl GeneralRegisters {
                 self.r14 = ctx.r14;
                 self.r15 = ctx.r15;
             }
-            VCpuSetupContext::Linux64BitBoot(ctx) => {
-                self.rbp = ctx.rbp;
-                self.rsi = ctx.rsi;
-            }
-            VCpuSetupContext::ParavirtBoot(ctx) => {
+            VCpuSetupContext::PVGuestContext(ctx) => {
                 self.rbp = ctx.rbp;
                 self.rsi = ctx.rsi;
                 self.rdi = ctx.rdi;

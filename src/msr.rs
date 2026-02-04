@@ -84,3 +84,9 @@ pub(super) trait MsrReadWrite {
         }
     }
 }
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct MsrEntry {
+    pub index: Msr,
+    pub data: u64,
+}

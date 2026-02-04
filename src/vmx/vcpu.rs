@@ -32,7 +32,7 @@ use super::vmcs::{
     VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, exit_qualification,
     interrupt_exit_info,
 };
-use crate::context::{Linux64BitBootContext, LinuxContext, ParavirtBootContext, VCpuSetupContext};
+use crate::context::{GuestContext, VCpuSetupContext};
 use crate::generated::msr_index::{MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST};
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
@@ -500,13 +500,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 self.vcpu_type = VCPUType::Host;
                 self.setup_vmcs_guest_from_ctx(host_ctx)?;
             }
-            VCpuSetupContext::Linux64BitBoot(ctx) => {
-                self.vcpu_type = VCPUType::EqParavirtGuest;
-                self.setup_vmcs_guest_from_pvboot_ctx(ctx)?;
-            }
-            VCpuSetupContext::ParavirtBoot(ctx) => {
-                // Paravirt boot uses similar setup to Linux64BitBoot
-                // but with Linux's final GDT layout
+            VCpuSetupContext::PVGuestContext(ctx) => {
                 self.vcpu_type = VCPUType::EqParavirtGuest;
                 self.setup_vmcs_guest_from_paravirt_ctx(ctx)?;
             }
@@ -559,128 +553,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
-    /// Indeed, this function can be combined with `setup_vmcs_guest`,
-    /// to avoid complexity and minimize the modification,
-    /// we just keep them separated.
-    fn setup_vmcs_guest_from_pvboot_ctx(&mut self, ctx: Linux64BitBootContext) -> AxResult {
-        // warn!(
-        //     "VCpu[{}] setup_vmcs_guest_from_pvboot_ctx: {:#x?}",
-        //     self.id, ctx
-        // );
-
-        self.set_cr(0, ctx.cr0.bits());
-        self.set_cr(4, ctx.cr4.bits());
-        self.set_cr(3, ctx.cr3);
-
-        macro_rules! set_guest_segment {
-            ($seg: expr, $reg: ident) => {{
-                use VmcsGuest16::*;
-                use VmcsGuest32::*;
-                use VmcsGuestNW::*;
-                concat_idents!($reg, _SELECTOR).write($seg.selector.bits())?;
-                concat_idents!($reg, _BASE).write($seg.base as _)?;
-                concat_idents!($reg, _LIMIT).write($seg.limit)?;
-                concat_idents!($reg, _ACCESS_RIGHTS).write($seg.access_rights.bits())?;
-            }};
-        }
-
-        macro_rules! set_guest_segment_raw {
-            ($access_rights: expr, $seg: ident) => {{
-                use VmcsGuest16::*;
-                use VmcsGuest32::*;
-                use VmcsGuestNW::*;
-                concat_idents!($seg, _SELECTOR).write(0)?;
-                concat_idents!($seg, _BASE).write(0)?;
-                concat_idents!($seg, _LIMIT).write(0xffff)?;
-                concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
-            }};
-        }
-
-        set_guest_segment!(ctx.es, ES);
-        set_guest_segment!(ctx.cs, CS);
-        set_guest_segment!(ctx.ss, SS);
-        set_guest_segment!(ctx.ds, DS);
-        set_guest_segment!(ctx.fs, FS);
-        set_guest_segment!(ctx.gs, GS);
-        set_guest_segment!(ctx.tss, TR);
-        set_guest_segment_raw!(0x82, LDTR); // present, system, LDT
-
-        VmcsGuestNW::GDTR_BASE.write(ctx.gdt.base.as_u64() as _)?;
-        VmcsGuest32::GDTR_LIMIT.write(ctx.gdt.limit as _)?;
-        VmcsGuestNW::IDTR_BASE.write(ctx.idt.base.as_u64() as _)?;
-        VmcsGuest32::IDTR_LIMIT.write(ctx.idt.limit as _)?;
-
-        VmcsGuestNW::RSP.write(ctx.rsp as _)?;
-        VmcsGuestNW::RIP.write(ctx.rip as _)?;
-        VmcsGuestNW::RFLAGS.write(ctx.rflags as _)?;
-
-        VmcsGuestNW::DR7.write(0x400)?;
-        VmcsGuest64::IA32_DEBUGCTL.write(0)?;
-
-        VmcsGuest32::ACTIVITY_STATE.write(0)?;
-        VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
-        VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
-
-        VmcsGuest64::LINK_PTR.write(u64::MAX)?;
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
-
-        let ia32_pat = Msr::IA32_PAT.read();
-        debug!("Guest IA32_PAT {:#x}", ia32_pat);
-        debug!("Guest IA32_EFER {:#x}", ctx.efer.bits());
-
-        VmcsGuest64::IA32_PAT.write(ia32_pat)?;
-        VmcsGuest64::IA32_EFER.write(ctx.efer.bits())?;
-
-        unsafe {
-            Msr::IA32_TSC_ADJUST.write(0);
-        }
-
-        for msr_entry in ctx.msr_entries {
-            match msr_entry.index {
-                Msr::IA32_SYSENTER_CS => {
-                    VmcsGuest32::IA32_SYSENTER_CS.write(msr_entry.data as _)?;
-                }
-                Msr::IA32_SYSENTER_ESP => {
-                    VmcsGuestNW::IA32_SYSENTER_ESP.write(msr_entry.data as _)?;
-                }
-                Msr::IA32_SYSENTER_EIP => {
-                    VmcsGuestNW::IA32_SYSENTER_EIP.write(msr_entry.data as _)?;
-                }
-                // x86_64 specific msrs
-                Msr::STAR | Msr::CSTAR | Msr::KERNEL_GSBASE | Msr::SYSCALL_MASK | Msr::LSTAR => {
-                    // These MSRs are not supported in VMX guest state fields.
-                    warn!(
-                        "PVBootContext contains unsupported MSR entry: {:?}",
-                        msr_entry.index
-                    );
-                }
-                // end of x86_64 specific code
-                Msr::IA32_TSC => unsafe {
-                    Msr::IA32_TSC.write(msr_entry.data);
-                },
-                Msr::IA32_MISC_ENABLE => unsafe {
-                    Msr::IA32_MISC_ENABLE.write(msr_entry.data);
-                },
-                Msr::MTRR_DEF_TYPE => unsafe {
-                    Msr::MTRR_DEF_TYPE.write(msr_entry.data);
-                },
-                _ => {
-                    warn!(
-                        "PVBootContext contains unsupported MSR entry: {:?}",
-                        msr_entry.index
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Setup VMCS guest state from paravirt boot context.
-    ///
-    /// This is similar to `setup_vmcs_guest_from_pvboot_ctx` but uses
-    /// Linux's final GDT layout for paravirtualized guests.
-    fn setup_vmcs_guest_from_paravirt_ctx(&mut self, ctx: ParavirtBootContext) -> AxResult {
+    fn setup_vmcs_guest_from_paravirt_ctx(&mut self, ctx: GuestContext) -> AxResult {
         debug!(
             "VCpu[{}] setup_vmcs_guest_from_paravirt_ctx: {:?}",
             self.id, ctx
@@ -747,18 +621,17 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuest64::LINK_PTR.write(u64::MAX)?;
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
 
-        let ia32_pat = Msr::IA32_PAT.read();
-        debug!("Guest IA32_PAT {:#x}", ia32_pat);
+        debug!("Guest IA32_PAT {:#x}", ctx.pat);
         debug!("Guest IA32_EFER {:#x}", ctx.efer.bits());
 
-        VmcsGuest64::IA32_PAT.write(ia32_pat)?;
+        VmcsGuest64::IA32_PAT.write(ctx.pat)?;
         VmcsGuest64::IA32_EFER.write(ctx.efer.bits())?;
 
         unsafe {
             Msr::IA32_TSC_ADJUST.write(0);
         }
 
-        for msr_entry in ctx.msr_entries {
+        for msr_entry in ctx.msr_entries.iter() {
             match msr_entry.index {
                 Msr::IA32_SYSENTER_CS => {
                     VmcsGuest32::IA32_SYSENTER_CS.write(msr_entry.data as _)?;
@@ -772,10 +645,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 Msr::STAR | Msr::CSTAR | Msr::KERNEL_GSBASE | Msr::SYSCALL_MASK | Msr::LSTAR => {
                     // These MSRs need to be set via MSR load/store areas
                     // For now, we skip them as they will be set by Linux
-                    debug!(
-                        "ParavirtBootContext contains syscall MSR: {:?}",
-                        msr_entry.index
-                    );
+                    debug!("GuestContext contains syscall MSR: {:?}", msr_entry.index);
                 }
                 Msr::IA32_TSC => unsafe {
                     Msr::IA32_TSC.write(msr_entry.data);
@@ -788,7 +658,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 },
                 _ => {
                     debug!(
-                        "ParavirtBootContext contains unsupported MSR entry: {:?}",
+                        "GuestContext contains unsupported MSR entry: {:?}",
                         msr_entry.index
                     );
                 }
@@ -796,8 +666,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
 
         // Setup some VMCS controls fields required by Linux paravirt boot
-        self.set_eptp_list_region(ctx.eptp_list_region_base)?;
-        self.set_hlat_pointer(ctx.hlat_ptr)?;
+        self.set_eptp_list_region(
+            ctx.eptp_list_region_base()
+                .ok_or_else(|| ax_err_type!(InvalidInput, "eptp_list_region_base is None"))?,
+        )?;
+        self.set_hlat_pointer(
+            ctx.hlat_ptr()
+                .ok_or_else(|| ax_err_type!(InvalidInput, "hlat_ptr is None"))?,
+        )?;
 
         Ok(())
     }
@@ -805,7 +681,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// Indeed, this function can be combined with `setup_vmcs_guest`,
     /// to avoid complexity and minimize the modification,
     /// we just keep them separated.
-    fn setup_vmcs_guest_from_ctx(&mut self, host_ctx: LinuxContext) -> AxResult {
+    fn setup_vmcs_guest_from_ctx(&mut self, host_ctx: GuestContext) -> AxResult {
         trace!(
             "VCpu[{}] setup_vmcs_guest_from_ctx: {:#x?}",
             self.id, host_ctx
@@ -1175,7 +1051,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
-    fn load_vmcs_guest(&self, linux: &mut LinuxContext) -> AxResult {
+    fn load_vmcs_guest(&self, linux: &mut GuestContext) -> AxResult {
         linux.rip = VmcsGuestNW::RIP.read()? as _;
         linux.rsp = VmcsGuestNW::RSP.read()? as _;
         linux.cr0 = Cr0Flags::from_bits_truncate(VmcsGuestNW::CR0.read()? as _);
@@ -1855,7 +1731,7 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
 
     type SetupConfig = ();
 
-    type HostContext = crate::context::LinuxContext;
+    type HostContext = crate::context::GuestContext;
 
     type VCpuSetupContext = crate::context::VCpuSetupContext;
 

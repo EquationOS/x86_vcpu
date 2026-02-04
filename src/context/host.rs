@@ -1,3 +1,6 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
 use x86::segmentation::SegmentSelector;
 use x86::{Ring, segmentation, task};
 use x86_64::VirtAddr;
@@ -6,7 +9,7 @@ use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr3Flags, Cr4, Cr4Flags, Ef
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::{addr::PhysAddr, structures::paging::PhysFrame};
 
-use crate::msr::Msr;
+use crate::msr::{Msr, MsrEntry};
 use crate::regs::GeneralRegisters;
 use crate::segmentation::{Segment, SegmentAccessRights};
 
