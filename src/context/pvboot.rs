@@ -8,18 +8,9 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use axaddrspace::{GuestPhysAddr, HostPhysAddr};
-use core::mem;
-
-use x86::Ring;
-use x86::segmentation::SegmentSelector;
-use x86_64::VirtAddr;
-use x86_64::registers::control::{Cr0Flags, Cr4Flags, EferFlags};
-use x86_64::structures::DescriptorTablePointer;
 
 use crate::generated::msr_index::*;
 use crate::msr::{Msr, MsrEntry};
-use crate::segmentation::{Segment, SegmentAccessRights};
 
 // ============================================================================
 // Standard Linux 64-bit Boot Protocol Constants
@@ -47,16 +38,6 @@ const X86_CR4_PAE: u64 = 0x20;
 
 // Initial pagetables.
 pub(super) const PML4_START: u64 = 0x9000;
-
-// ============================================================================
-// Paravirt Boot Protocol Constants
-// ============================================================================
-
-/// Magic number for paravirt shared info validation: "AXPV" in little-endian
-pub const PV_SHARED_INFO_MAGIC: u32 = 0x5650_5841;
-
-/// Version of the paravirt shared info structure
-pub const PV_SHARED_INFO_VERSION: u32 = 1;
 
 /// Creates and populates required MSR entries for booting Linux on X86_64.
 pub fn create_boot_msr_entries() -> Vec<MsrEntry> {
@@ -90,118 +71,4 @@ pub fn create_boot_msr_entries() -> Vec<MsrEntry> {
             data: (1 << 11) | 0x6,
         },
     ]
-}
-
-/// Per-vCPU information shared between Gate and Linux.
-/// This structure is used for communication about vCPU state.
-/// Size: 64 bytes (cache-line aligned for performance)
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PvVcpuInfo {
-    /// vCPU state (see PV_VCPU_STATE_* constants)
-    pub state: u32,
-    /// Pending events bitmap
-    pub pending_events: u32,
-    /// GS base register value (per-CPU data pointer)
-    pub gs_base: u64,
-    /// FS base register value (TLS pointer)
-    pub fs_base: u64,
-    /// Kernel GS base (for swapgs)
-    pub kernel_gs_base: u64,
-    /// Reserved for future use (padding to 64 bytes)
-    pub _reserved: [u64; 4],
-}
-
-/// vCPU state: offline
-pub const PV_VCPU_STATE_OFFLINE: u32 = 0;
-/// vCPU state: online and ready to run
-pub const PV_VCPU_STATE_ONLINE: u32 = 1;
-/// vCPU state: currently running
-pub const PV_VCPU_STATE_RUNNING: u32 = 2;
-/// vCPU state: idle (no tasks)
-pub const PV_VCPU_STATE_IDLE: u32 = 3;
-/// vCPU state: parked (yielded CPU)
-pub const PV_VCPU_STATE_PARKED: u32 = 4;
-
-/// Shared information structure between Gate and Linux guests.
-/// This structure is placed at a fixed guest physical address (PV_SHARED_INFO_GPA).
-///
-/// The Gate initializes this structure before switching to Linux.
-/// Linux reads from it to get configuration and writes to it to communicate with Gate.
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PvSharedInfo {
-    /// Magic number for validation: PV_SHARED_INFO_MAGIC ("AXPV")
-    pub magic: u32,
-    /// Version of this structure: PV_SHARED_INFO_VERSION
-    pub version: u32,
-    /// Unique ID for this guest instance
-    pub id: u32,
-
-    /// Maximum number of vCPUs configured for this guest
-    pub max_vcpus: u32,
-    /// Currently online vCPUs
-    pub online_vcpus: u32,
-
-    /// Flags (see PV_SHARED_FLAG_* constants)
-    pub flags: u32,
-    /// Reserved for alignment
-    pub _reserved1: u32,
-
-    /// Guest virtual address of the shared GDT
-    pub gdt_vaddr: u64,
-    /// Guest virtual address of the shared IDT
-    pub idt_vaddr: u64,
-    /// Guest virtual address of the per-guest TSS
-    pub tss_vaddr: u64,
-    /// Guest physical address of boot_params (zero page)
-    pub boot_params_gpa: u64,
-
-    /// Linux kernel entry point virtual address
-    pub linux_entry: u64,
-    /// Linux CR3 (page table root physical address)
-    pub linux_cr3: u64,
-    /// Linux initial stack pointer
-    pub linux_rsp: u64,
-    /// Linux kernel command line physical address
-    pub cmdline_gpa: u64,
-
-    /// Per-vCPU information array
-    pub vcpu_info: [PvVcpuInfo; 32],
-
-    /// Reserved space for future extensions
-    pub _reserved2: [u64; 32],
-}
-
-/// Flag: Gate has finished initialization
-pub const PV_SHARED_FLAG_GATE_READY: u32 = 1 << 0;
-/// Flag: Linux should skip GDT initialization
-pub const PV_SHARED_FLAG_SKIP_GDT_INIT: u32 = 1 << 1;
-/// Flag: Linux should skip IDT initialization
-pub const PV_SHARED_FLAG_SKIP_IDT_INIT: u32 = 1 << 2;
-/// Flag: Linux should skip TSS initialization
-pub const PV_SHARED_FLAG_SKIP_TSS_INIT: u32 = 1 << 3;
-/// Flag: Linux should skip LAPIC initialization
-pub const PV_SHARED_FLAG_SKIP_LAPIC_INIT: u32 = 1 << 4;
-
-impl PvSharedInfo {
-    /// Validate the magic number and version.
-    pub fn is_valid(&self) -> bool {
-        self.magic == PV_SHARED_INFO_MAGIC && self.version == PV_SHARED_INFO_VERSION
-    }
-
-    /// Check if a specific flag is set.
-    pub fn has_flag(&self, flag: u32) -> bool {
-        self.flags & flag != 0
-    }
-
-    /// Set a flag.
-    pub fn set_flag(&mut self, flag: u32) {
-        self.flags |= flag;
-    }
-
-    /// Clear a flag.
-    pub fn clear_flag(&mut self, flag: u32) {
-        self.flags &= !flag;
-    }
 }
