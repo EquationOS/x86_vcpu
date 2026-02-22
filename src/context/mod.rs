@@ -1,4 +1,5 @@
 mod ctx;
+#[allow(unused)]
 mod pvboot;
 
 pub use ctx::GuestContext;
