@@ -344,7 +344,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     }
 
     pub fn read_guest_memory(&self, gva: GuestVirtAddr, len: usize) -> AxResult<Vec<u8>> {
-        debug!("read_guest_memory @{:?} len: {}", gva, len);
+        info!("read_guest_memory @{:?} len: {}", gva, len);
 
         let mut content = Vec::with_capacity(len as usize);
 
@@ -373,7 +373,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 return ax_err!(BadAddress);
             }
         }
-        debug!("read_guest_memory @{:?} content: {:x?}", gva, content);
+        info!("read_guest_memory @{:?} content: {:x?}", gva, content);
         Ok(content)
     }
 
@@ -1677,6 +1677,8 @@ impl<H: AxVCpuHal> Debug for VmxVcpu<H> {
             let gdt_limit = VmcsGuest32::GDTR_LIMIT.read()?;
             let idt_base = VirtAddr::new(VmcsGuestNW::IDTR_BASE.read()? as _);
             let idt_limit = VmcsGuest32::IDTR_LIMIT.read()?;
+            let tr_base = VirtAddr::new(VmcsGuestNW::TR_BASE.read()? as _);
+            let tr_limit = VmcsGuest32::TR_LIMIT.read()?;
 
             let ia32_sysenter_cs = VmcsGuest32::IA32_SYSENTER_CS.read()?;
             let ia32_sysenter_esp = VmcsGuestNW::IA32_SYSENTER_ESP.read()?;
@@ -1715,6 +1717,8 @@ impl<H: AxVCpuHal> Debug for VmxVcpu<H> {
                 .field("gdt_limit", &gdt_limit)
                 .field("idt_base", &idt_base)
                 .field("idt_limit", &idt_limit)
+                .field("tr_base", &tr_base)
+                .field("tr_limit", &tr_limit)
                 .field("efer_raw", &efer_raw)
                 .field("efer", &efer)
                 .field("ia32_sysenter_cs", &ia32_sysenter_cs)
@@ -1869,6 +1873,16 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                             GuestVirtAddr::from_usize(exit_info.guest_rip),
                             exit_info.exit_instruction_length as _,
                         )?;
+
+                        self.decode_instruction(
+                            GuestVirtAddr::from_usize(
+                                exit_info.guest_rip - exit_info.exit_instruction_length as usize,
+                            ),
+                            exit_info.exit_instruction_length as _,
+                        )?;
+
+                        let _smpboot_control = self
+                            .read_guest_memory(GuestVirtAddr::from_usize(0xffffffff82a36000), 1)?;
 
                         AxVCpuExitReason::Halt
                     }

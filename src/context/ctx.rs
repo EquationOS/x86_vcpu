@@ -380,10 +380,9 @@ impl GuestContext {
                 | Cr4Flags::OSFXSR
                 | Cr4Flags::OSXMMEXCPT_ENABLE
                 | Cr4Flags::OSXSAVE,
-            efer: EferFlags::LONG_MODE_ENABLE
-                | EferFlags::LONG_MODE_ACTIVE
-                | EferFlags::NO_EXECUTE_ENABLE
-                | EferFlags::SYSTEM_CALL_EXTENSIONS,
+            efer: EferFlags::LONG_MODE_ENABLE | EferFlags::LONG_MODE_ACTIVE,
+            // | EferFlags::NO_EXECUTE_ENABLE
+            // | EferFlags::SYSTEM_CALL_EXTENSIONS,
             star: 0,
             lstar: 0,
             cstar: 0,
