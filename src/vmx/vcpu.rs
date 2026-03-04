@@ -29,9 +29,10 @@ use super::read_vmcs_revision_id;
 use super::structs::{EptpList, IOBitmap, MsrBitmap, VmxRegion};
 use super::vmcs::{
     self, VmcsControl16, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
-    VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, exit_qualification,
-    interrupt_exit_info,
+    VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, VmxInterruptInfo,
+    exit_qualification, interrupt_exit_info,
 };
+
 use crate::context::{GuestContext, VCpuSetupContext};
 use crate::generated::msr_index::{MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST};
 use crate::page_table::GuestPageTable64;
@@ -998,6 +999,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
+    fn hlat_pointer(&self) -> AxResult<GuestPhysAddr> {
+        let hlat_ptr_val = VmcsControl64::HLATP.read()?;
+        let hlat_ptr = GuestPhysAddr::from_usize(hlat_ptr_val as usize);
+        Ok(hlat_ptr)
+    }
+
     fn set_hlat_pointer(&mut self, hlat_ptr: GuestPhysAddr) -> AxResult {
         // The hypervisor-managed linear-address translation pointer (HLAT pointer or HLATP)
         // is used by HLAT paging to locate and access the first paging structure used for
@@ -1121,6 +1128,43 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vaddr + seg_base
     }
 
+    /// Query HLAT paging to get mapping info, this is used for paravirtualized guest only.
+    fn guest_hlat_query(&self, gva: GuestVirtAddr) -> AxResult {
+        let addr = self.gva_to_linear_addr(gva);
+
+        if !addr.as_usize().get_bit(63) {
+            return ax_err!(
+                InvalidInput,
+                format_args!(
+                    "HLAT paging only supports canonical address, but got non-canonical address {:#x}",
+                    addr.as_usize()
+                )
+            );
+        }
+
+        let mut guest_ptw_info = self.get_pagetable_walk_info();
+        // Set HLAT pointer as the CR3 value for page table walk, as HLAT paging uses a separate pointer to locate the first paging structure.
+        guest_ptw_info.cr3 = self.hlat_pointer()?.as_usize();
+
+        let guest_page_table: GuestPageTable64<X64PTE, H::PagingHandler, H::EPTTranslator> =
+            GuestPageTable64::construct(&guest_ptw_info);
+
+        match guest_page_table.query(addr) {
+            Ok((gpa, flags, page_size)) => {
+                info!(
+                    "HLAT query for GVA {:#x} -> GPA {:#x}, flags: {:?}, page size: {:?}",
+                    gva, gpa, flags, page_size
+                );
+            }
+            Err(e) => {
+                warn!("HLAT query failed for GVA {:#x}: {:?}", gva, e);
+            }
+        }
+
+        // Just a sanity check, do not throw error even if the query fails.
+        Ok(())
+    }
+
     /// Query guest page table to get mapping info.
     pub fn guest_page_table_query(
         &self,
@@ -1146,6 +1190,45 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             GuestPageTable64::construct(&guest_ptw_info);
 
         guest_page_table.query_raw(addr)
+    }
+
+    fn check_guest_page_fault(
+        &self,
+        exit_info: &VmxExitInfo,
+        intr_info: &VmxInterruptInfo,
+    ) -> AxResult {
+        let error_code = intr_info.err_code;
+        warn!(
+            "Page Fault in guest: RIP({:#x}),  error code {:#x?}",
+            exit_info.guest_rip, error_code
+        );
+
+        let error_code = match error_code {
+            Some(code) => code,
+            None => {
+                warn!(
+                    "Page Fault exit without error code, this should not happen, treat it as a reserved bit violation"
+                );
+                return Ok(());
+            }
+        };
+
+        const PAGE_FAULT_ERROR_CODE_HLAT: u32 = 1 << 7;
+        if error_code & PAGE_FAULT_ERROR_CODE_HLAT != 0 {
+            warn!("Page Fault caused by HLAT paging");
+
+            let addr = exit_info.guest_rip;
+            warn!("Faulting instruction address: {:#x}", addr);
+
+            let hlat_ptr = self.hlat_pointer()?;
+            warn!("HLAT pointer: {:?}", hlat_ptr);
+
+            self.guest_hlat_query(GuestVirtAddr::from_usize(addr))?;
+
+            return Ok(());
+        }
+
+        Ok(())
     }
 }
 
@@ -1411,12 +1494,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         )?;
 
         const NON_MASKABLE_INTERRUPT: u8 = 2;
+        const PAGE_FAULT: u8 = 14;
 
         match intr_info.vector {
             // ExceptionType::NonMaskableInterrupt
             NON_MASKABLE_INTERRUPT => unsafe {
                 core::arch::asm!("int {}", const NON_MASKABLE_INTERRUPT)
             },
+            // ExceptionType::PageFault
+            PAGE_FAULT => {
+                self.check_guest_page_fault(exit_info, &intr_info)?;
+                self.queue_event(PAGE_FAULT, intr_info.err_code);
+            }
             v => {
                 warn!("Unhandled Guest Exception: #{:#x}, inject to user", v);
                 self.queue_event(v, intr_info.err_code);
