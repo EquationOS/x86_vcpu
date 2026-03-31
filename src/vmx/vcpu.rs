@@ -405,7 +405,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         // By default, I/O bitmap is set as `intercept_all`.
         // Todo: these should be combined with emulated pio device management,
         // in `modules/axvm/src/device/x86_64/mod.rs` somehow.
-        let io_to_be_intercepted = [
+        let mut io_to_be_intercepted: Vec<core::ops::Range<u16>> = Vec::new();
+        io_to_be_intercepted.push(
             // // UART
             // // 0x3f8..0x3f8 + 8, // COM1
             // // We need to intercepted the access to COM2 ports.
@@ -432,8 +433,15 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             // 0xcf8..0xcf8 + 8, // PCI
 
             // QEMU exit port
-            QEMU_EXIT_PORT..QEMU_EXIT_PORT + 1, // QEMU exit port
-        ];
+            QEMU_EXIT_PORT..QEMU_EXIT_PORT + 1,
+        ); // QEMU exit port
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            // Intercept PCI config mechanism #1:
+            // - address register: 0xcf8..=0xcfb
+            // - data window:      0xcfc..=0xcff
+            io_to_be_intercepted.push(0xcf8..0xcf8 + 4);
+            io_to_be_intercepted.push(0xcfc..0xcfc + 4);
+        }
         for port_range in io_to_be_intercepted {
             self.io_bitmap.set_intercept_of_range(
                 port_range.start as _,
