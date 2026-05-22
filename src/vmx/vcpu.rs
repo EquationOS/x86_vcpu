@@ -1670,6 +1670,11 @@ impl<H: AxVCpuHal> AxVcpuAccessGuestState for VmxVcpu<H> {
         Ok(())
     }
 
+    fn set_ept_pointer_no_invept(&mut self, eptp: EPTPointer) -> AxResult {
+        VmcsControl64::EPTP.write(eptp.bits())?;
+        Ok(())
+    }
+
     fn get_ve_information_area(&self) -> HostPhysAddr {
         self.ve_information_area.phys_addr()
     }
