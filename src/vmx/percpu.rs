@@ -107,7 +107,6 @@ impl<H: AxVCpuHal> AxArchPerCpu for VmxPerCpuState<H> {
             Cr0Flags::PAGING.bits()
                 | Cr0Flags::WRITE_PROTECT.bits()
                 | Cr0Flags::NUMERIC_ERROR.bits()
-                | Cr0Flags::TASK_SWITCHED.bits()
                 | Cr0Flags::MONITOR_COPROCESSOR.bits()
                 | Cr0Flags::PROTECTED_MODE_ENABLE.bits(),
         );

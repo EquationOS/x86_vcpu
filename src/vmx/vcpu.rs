@@ -7,7 +7,6 @@ use memory_addr::MemoryAddr;
 use bit_field::BitField;
 use raw_cpuid::CpuId;
 use x86::bits64::vmx;
-use x86::controlregs::Xcr0;
 use x86::dtables::{self, DescriptorTablePointer};
 use x86::segmentation::SegmentSelector;
 use x86_64::VirtAddr;
@@ -34,7 +33,9 @@ use super::vmcs::{
 };
 
 use crate::context::{GuestContext, VCpuSetupContext};
-use crate::generated::msr_index::{MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST};
+use crate::generated::msr_index::{
+    MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_XFD, MSR_IA32_XFD_ERR, MSR_IA32_XSS,
+};
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
 use crate::segmentation::{Segment, SegmentAccessRights};
@@ -474,6 +475,11 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 .set_write_intercept(MSR_IA32_TSC_ADJUST, true);
             // Intercept IA32_APICBASE MSR accesses
             self.msr_bitmap.set_read_intercept(MSR_IA32_APICBASE, true);
+        }
+
+        for msr in [MSR_IA32_XSS, MSR_IA32_XFD, MSR_IA32_XFD_ERR] {
+            self.msr_bitmap.set_read_intercept(msr, true);
+            self.msr_bitmap.set_write_intercept(msr, true);
         }
 
         // Intercept all x2APIC MSR accesses
@@ -1389,15 +1395,42 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     fn handle_msr_write(&mut self, exit_info: &VmxExitInfo) -> AxResult {
         let ecx = self.regs().rcx as u32;
+        let new_value = (self.regs().rdx << 32) | self.regs().rax;
 
         match ecx {
             MSR_IA32_TSC_ADJUST => {
-                let new_value = (self.regs().rdx << 32) | self.regs().rax;
                 self.tsc_adjust = new_value;
                 warn!(
                     "VMX MSR-Write Exit: Set MSR_IA32_TSC_ADJUST to {:#x}",
                     new_value
                 );
+            }
+            MSR_IA32_XSS => {
+                if !self.xstate.is_xss_supported(new_value) {
+                    return ax_err!(
+                        InvalidInput,
+                        format_args!("unsupported IA32_XSS value: {:#x}", new_value)
+                    );
+                }
+                self.xstate.set_guest_xss(new_value);
+            }
+            MSR_IA32_XFD => {
+                if !self.xstate.is_xfd_supported(new_value) {
+                    return ax_err!(
+                        InvalidInput,
+                        format_args!("unsupported IA32_XFD value: {:#x}", new_value)
+                    );
+                }
+                self.xstate.set_guest_xfd(new_value);
+            }
+            MSR_IA32_XFD_ERR => {
+                if !self.xstate.is_xfd_supported(new_value) {
+                    return ax_err!(
+                        InvalidInput,
+                        format_args!("unsupported IA32_XFD_ERR value: {:#x}", new_value)
+                    );
+                }
+                self.xstate.set_guest_xfd_err(new_value);
             }
             _ => {
                 return ax_err!(
@@ -1441,6 +1474,21 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 self.regs_mut().rdx = (msr_value >> 32) as u64;
 
                 info!("VMX MSR-Read Exit: MSR_IA32_TSC_ADJUST = {:#x}", msr_value);
+            }
+            MSR_IA32_XSS => {
+                let msr_value = self.xstate.guest_xss();
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+            }
+            MSR_IA32_XFD => {
+                let msr_value = self.xstate.guest_xfd();
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+            }
+            MSR_IA32_XFD_ERR => {
+                let msr_value = self.xstate.guest_xfd_err();
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
             }
             _ => {
                 return ax_err!(
@@ -1654,45 +1702,21 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let index = self.guest_regs.rcx.get_bits(0..32);
         let value = self.guest_regs.rdx.get_bits(0..32) << 32 | self.guest_regs.rax.get_bits(0..32);
 
-        // TODO: get host-supported xcr0 mask by cpuid and reject any guest-xsetbv violating that
         if index == XCR_XCR0 {
-            Xcr0::from_bits(value)
-                .and_then(|x| {
-                    if !x.contains(Xcr0::XCR0_FPU_MMX_STATE) {
-                        return None;
-                    }
-
-                    if x.contains(Xcr0::XCR0_AVX_STATE) && !x.contains(Xcr0::XCR0_SSE_STATE) {
-                        return None;
-                    }
-
-                    if x.contains(Xcr0::XCR0_BNDCSR_STATE) ^ x.contains(Xcr0::XCR0_BNDREG_STATE) {
-                        return None;
-                    }
-
-                    if (x.contains(Xcr0::XCR0_OPMASK_STATE)
-                        || x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
-                        || x.contains(Xcr0::XCR0_HI16_ZMM_STATE))
-                        && (!x.contains(Xcr0::XCR0_AVX_STATE)
-                            || !x.contains(Xcr0::XCR0_OPMASK_STATE)
-                            || !x.contains(Xcr0::XCR0_ZMM_HI256_STATE)
-                            || !x.contains(Xcr0::XCR0_HI16_ZMM_STATE))
-                    {
-                        return None;
-                    }
-
-                    Some(x)
-                })
-                .ok_or_else(|| {
-                    ax_err_type!(
-                        InvalidInput,
-                        format_args!("invalid xcr0 value: {:#x}", value)
-                    )
-                })
-                .and_then(|x| {
-                    self.xstate.guest_xcr0 = x.bits();
-                    self.advance_rip(VM_EXIT_INSTR_LEN_XSETBV)
-                })
+            if !XState::validate_xcr0(value) {
+                return ax_err!(
+                    InvalidInput,
+                    format_args!("invalid xcr0 value: {:#x}", value)
+                );
+            }
+            if !self.xstate.is_xcr0_supported(value) {
+                return ax_err!(
+                    InvalidInput,
+                    format_args!("unsupported xcr0 value: {:#x}", value)
+                );
+            }
+            self.xstate.set_guest_xcr0(value);
+            self.advance_rip(VM_EXIT_INSTR_LEN_XSETBV)
         } else {
             // xcr0 only
             ax_err!(Unsupported, "only xcr0 is supported")
@@ -1704,8 +1728,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     ///
     /// This function is generally called before VM-entry.
     fn load_guest_xstate(&mut self) {
-        // FIXME: Linux will throw a UD exception if we save/restore xstate.
-        // self.xstate.switch_to_guest();
+        self.xstate.switch_to_guest();
     }
 
     /// Save the current guest state to the vcpu,
@@ -1713,7 +1736,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     ///
     /// This function is generally called after VM-exit.
     fn load_host_xstate(&mut self) {
-        // self.xstate.switch_to_host();
+        self.xstate.switch_to_host();
     }
 }
 

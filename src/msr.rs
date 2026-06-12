@@ -17,6 +17,8 @@ pub enum Msr {
     IA32_SYSENTER_EIP = 0x176,
 
     IA32_MISC_ENABLE = 0x1a0,
+    IA32_XFD = 0x1c4,
+    IA32_XFD_ERR = 0x1c5,
 
     IA32_PAT = 0x277,
     MTRR_DEF_TYPE = 0x2ff,
