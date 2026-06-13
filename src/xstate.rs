@@ -24,6 +24,14 @@ pub const XFEATURE_REQUIRED: u64 = XFEATURE_FP;
 
 const XSAVE_AREA_ALIGN: usize = 64;
 const XSAVE_LEGACY_AREA_SIZE: usize = 512;
+const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_AREA_SIZE;
+const XSAVE_HEADER_SIZE: usize = 64;
+const XSAVE_HEADER_XFEATURES_OFFSET: usize = XSAVE_HEADER_OFFSET;
+const XSAVE_HEADER_XCOMP_BV_OFFSET: usize = XSAVE_HEADER_OFFSET + 8;
+const XSAVE_HEADER_RESERVED_OFFSET: usize = XSAVE_HEADER_OFFSET + 16;
+const XSAVE_HEADER_RESERVED_SIZE: usize = XSAVE_HEADER_SIZE - 16;
+const XCOMP_BV_COMPACTED_FORMAT: u64 = 1 << 63;
+const XFEATURE_LEGACY: u64 = XFEATURE_FP | XFEATURE_SSE;
 
 pub struct XState {
     host_xcr0: u64,
@@ -106,6 +114,7 @@ impl XState {
         let xstate_mask = Self::xstate_mask(xsaves_available, xcr0, xss);
         if let Some(area) = host_xsave.as_mut() {
             unsafe {
+                area.prepare_for_xstate_mask(xstate_mask, xsaves_available);
                 clear_task_switched();
                 save_xstate(area.as_mut_ptr(), xstate_mask, xsaves_available);
             }
@@ -113,6 +122,7 @@ impl XState {
         if let (Some(host), Some(guest)) = (host_xsave.as_ref(), guest_xsave.as_mut()) {
             unsafe {
                 copy_nonoverlapping(host.as_ptr(), guest.as_mut_ptr(), xsave_area_size);
+                guest.prepare_for_xstate_mask(xstate_mask, xsaves_available);
             }
         }
 
@@ -176,10 +186,32 @@ impl XState {
     fn xsave_area_size() -> usize {
         let standard = raw_cpuid_count(0x0d, 0);
         let compacted = raw_cpuid_count(0x0d, 1);
+        let (supported_xcr0, supported_xss) = Self::supported_xfeatures();
+        let supported_compacted =
+            Self::compacted_xsave_area_size(supported_xcr0 | supported_xss);
         (standard.ecx as usize)
             .max(standard.ebx as usize)
             .max(compacted.ebx as usize)
+            .max(supported_compacted)
             .max(XSAVE_LEGACY_AREA_SIZE)
+    }
+
+    fn compacted_xsave_area_size(mask: u64) -> usize {
+        let mut size = XSAVE_LEGACY_AREA_SIZE + XSAVE_HEADER_SIZE;
+        let mut feature = 2;
+
+        while feature < 64 {
+            if (mask & (1u64 << feature)) != 0 {
+                let res = raw_cpuid_count(0x0d, feature);
+                if res.ecx & (1 << 1) != 0 {
+                    size = align_up(size, XSAVE_AREA_ALIGN);
+                }
+                size += res.eax as usize;
+            }
+            feature += 1;
+        }
+
+        size
     }
 
     fn xstate_mask(xsaves_available: bool, xcr0: u64, xss: u64) -> u64 {
@@ -222,10 +254,12 @@ impl XState {
 
     pub fn set_guest_xcr0(&mut self, xcr0: u64) {
         self.guest_xcr0 = xcr0;
+        self.prepare_guest_xsave();
     }
 
     pub fn set_guest_xss(&mut self, xss: u64) {
         self.guest_xss = xss;
+        self.prepare_guest_xsave();
     }
 
     pub fn guest_xss(&self) -> u64 {
@@ -248,6 +282,26 @@ impl XState {
         self.guest_xfd_err
     }
 
+    fn prepare_guest_xsave(&mut self) {
+        let guest_xstate_mask =
+            Self::xstate_mask(self.xsaves_available, self.guest_xcr0, self.guest_xss);
+        if let Some(area) = self.guest_xsave.as_mut() {
+            unsafe {
+                area.prepare_for_xstate_mask(guest_xstate_mask, self.xsaves_available);
+            }
+        }
+    }
+
+    fn prepare_host_xsave(&mut self) {
+        let host_xstate_mask =
+            Self::xstate_mask(self.xsaves_available, self.host_xcr0, self.host_xss);
+        if let Some(area) = self.host_xsave.as_mut() {
+            unsafe {
+                area.prepare_for_xstate_mask(host_xstate_mask, self.xsaves_available);
+            }
+        }
+    }
+
     /// Save the current host XCR0 and IA32_XSS values and load the guest values.
     #[allow(unused)]
     pub fn switch_to_guest(&mut self) {
@@ -264,6 +318,7 @@ impl XState {
 
                 let host_xstate_mask =
                     Self::xstate_mask(self.xsaves_available, self.host_xcr0, self.host_xss);
+                self.prepare_host_xsave();
                 if let Some(area) = self.host_xsave.as_mut() {
                     clear_task_switched();
                     save_xstate(area.as_mut_ptr(), host_xstate_mask, self.xsaves_available);
@@ -273,14 +328,15 @@ impl XState {
                     Msr::IA32_XSS.write(self.guest_xss);
                 }
                 xcr0_write(Xcr0::from_bits_unchecked(self.guest_xcr0));
-                let guest_xstate_mask =
-                    Self::xstate_mask(self.xsaves_available, self.guest_xcr0, self.guest_xss);
-                if let Some(area) = self.guest_xsave.as_mut() {
-                    restore_xstate(area.as_ptr(), guest_xstate_mask, self.xsaves_available);
-                }
                 if self.xfd_available {
                     Msr::IA32_XFD.write(self.guest_xfd);
                     Msr::IA32_XFD_ERR.write(self.guest_xfd_err);
+                }
+                let guest_xstate_mask =
+                    Self::xstate_mask(self.xsaves_available, self.guest_xcr0, self.guest_xss);
+                self.prepare_guest_xsave();
+                if let Some(area) = self.guest_xsave.as_mut() {
+                    restore_xstate(area.as_ptr(), guest_xstate_mask, self.xsaves_available);
                 }
             }
         }
@@ -302,6 +358,7 @@ impl XState {
 
                 let guest_xstate_mask =
                     Self::xstate_mask(self.xsaves_available, self.guest_xcr0, self.guest_xss);
+                self.prepare_guest_xsave();
                 if let Some(area) = self.guest_xsave.as_mut() {
                     clear_task_switched();
                     save_xstate(area.as_mut_ptr(), guest_xstate_mask, self.xsaves_available);
@@ -311,18 +368,24 @@ impl XState {
                     Msr::IA32_XSS.write(self.host_xss);
                 }
                 xcr0_write(Xcr0::from_bits_unchecked(self.host_xcr0));
-                let host_xstate_mask =
-                    Self::xstate_mask(self.xsaves_available, self.host_xcr0, self.host_xss);
-                if let Some(area) = self.host_xsave.as_mut() {
-                    restore_xstate(area.as_ptr(), host_xstate_mask, self.xsaves_available);
-                }
                 if self.xfd_available {
                     Msr::IA32_XFD.write(self.host_xfd);
                     Msr::IA32_XFD_ERR.write(self.host_xfd_err);
                 }
+                let host_xstate_mask =
+                    Self::xstate_mask(self.xsaves_available, self.host_xcr0, self.host_xss);
+                self.prepare_host_xsave();
+                if let Some(area) = self.host_xsave.as_mut() {
+                    restore_xstate(area.as_ptr(), host_xstate_mask, self.xsaves_available);
+                }
             }
         }
     }
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
 }
 
 struct XSaveArea {
@@ -344,6 +407,43 @@ impl XSaveArea {
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr.as_ptr()
+    }
+
+    unsafe fn prepare_for_xstate_mask(&mut self, mask: u64, compacted: bool) {
+        if !compacted {
+            return;
+        }
+
+        let xfeatures = unsafe { self.read_u64(XSAVE_HEADER_XFEATURES_OFFSET) };
+        let xcomp_bv = unsafe { self.read_u64(XSAVE_HEADER_XCOMP_BV_OFFSET) };
+        let expected_xcomp_bv = mask | XCOMP_BV_COMPACTED_FORMAT;
+
+        if xcomp_bv != expected_xcomp_bv {
+            unsafe {
+                self.write_u64(
+                    XSAVE_HEADER_XFEATURES_OFFSET,
+                    xfeatures & mask & XFEATURE_LEGACY,
+                );
+                self.write_u64(XSAVE_HEADER_XCOMP_BV_OFFSET, expected_xcomp_bv);
+                self.clear_bytes(XSAVE_HEADER_RESERVED_OFFSET, XSAVE_HEADER_RESERVED_SIZE);
+            }
+        }
+    }
+
+    unsafe fn read_u64(&self, offset: usize) -> u64 {
+        unsafe { (self.ptr.as_ptr().add(offset) as *const u64).read_unaligned() }
+    }
+
+    unsafe fn write_u64(&mut self, offset: usize, value: u64) {
+        unsafe {
+            (self.ptr.as_ptr().add(offset) as *mut u64).write_unaligned(value);
+        }
+    }
+
+    unsafe fn clear_bytes(&mut self, offset: usize, len: usize) {
+        unsafe {
+            self.ptr.as_ptr().add(offset).write_bytes(0, len);
+        }
     }
 }
 
