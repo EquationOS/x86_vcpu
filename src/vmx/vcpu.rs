@@ -42,7 +42,7 @@ use crate::segmentation::{Segment, SegmentAccessRights};
 use crate::xstate::XState;
 use crate::{msr::Msr, regs::GeneralRegisters};
 
-const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 1_000_000;
+const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 50_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
 const QEMU_EXIT_MAGIC: u64 = 0x2000;
@@ -315,6 +315,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// and try to inject it before later VM entries.
     pub fn queue_event(&mut self, vector: u8, err_code: Option<u32>) {
         self.pending_events.push_back((vector, err_code));
+    }
+
+    pub fn has_pending_event(&self, vector: u8) -> bool {
+        self.pending_events.iter().any(|(event, _)| *event == vector)
     }
 
     /// If enable, a VM exit occurs at the beginning of any instruction if
@@ -818,18 +822,20 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         use PinbasedControls as PinCtrl;
         let raw_cpuid = CpuId::new();
 
+        let mut pinbased_controls = if self.vcpu_type != VCPUType::Host {
+            PinCtrl::NMI_EXITING.bits()
+        } else {
+            0 // Do not intercept NMI in for host VM now.
+        };
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            pinbased_controls |= PinCtrl::VMX_PREEMPTION_TIMER.bits();
+        }
+
         vmcs::set_control(
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
-            // (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
-            // (PinCtrl::NMI_EXITING | PinCtrl::VMX_PREEMPTION_TIMER).bits(),
-            // PinCtrl::NMI_EXITING.bits(),
-            if self.vcpu_type != VCPUType::Host {
-                PinCtrl::NMI_EXITING.bits()
-            } else {
-                0 // Do not intercept NMI in for host VM now.
-            },
+            pinbased_controls,
             0,
         )?;
 
