@@ -1,6 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::naked_asm, mem::size_of};
 use memory_addr::MemoryAddr;
 
@@ -25,7 +26,9 @@ use super::VmxExitInfo;
 use super::as_axerr;
 use super::definitions::VmxExitReason;
 use super::read_vmcs_revision_id;
-use super::structs::{EptpList, IOBitmap, MsrBitmap, VmxRegion};
+use super::structs::{
+    EptpList, IOBitmap, MsrBitmap, PostedInterruptDescriptor, VmxRegion, POSTED_INTR_VECTOR,
+};
 use super::vmcs::{
     self, VmcsControl16, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
     VmcsGuest64, VmcsGuestNW, VmcsHost16, VmcsHost32, VmcsHost64, VmcsHostNW, VmxInterruptInfo,
@@ -33,6 +36,7 @@ use super::vmcs::{
 };
 
 use crate::context::{GuestContext, VCpuSetupContext};
+use crate::frame::PhysFrame;
 use crate::generated::msr_index::{
     MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_XFD, MSR_IA32_XFD_ERR, MSR_IA32_XSS,
 };
@@ -42,10 +46,39 @@ use crate::segmentation::{Segment, SegmentAccessRights};
 use crate::xstate::XState;
 use crate::{msr::Msr, regs::GeneralRegisters};
 
-const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 50_000;
+const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 2_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
 const QEMU_EXIT_MAGIC: u64 = 0x2000;
+
+const APIC_ID: usize = 0x020;
+const APIC_LVR: usize = 0x030;
+const APIC_TASKPRI: usize = 0x080;
+const APIC_PROCPRI: usize = 0x0a0;
+const APIC_LDR: usize = 0x0d0;
+const APIC_DFR: usize = 0x0e0;
+const APIC_SPIV: usize = 0x0f0;
+const APIC_ISR: usize = 0x100;
+const APIC_IRR: usize = 0x200;
+const APIC_ESR: usize = 0x280;
+const APIC_LVTCMCI: usize = 0x2f0;
+const APIC_LVTT: usize = 0x320;
+const APIC_LVTTHMR: usize = 0x330;
+const APIC_LVTPC: usize = 0x340;
+const APIC_LVT0: usize = 0x350;
+const APIC_LVT1: usize = 0x360;
+const APIC_LVTERR: usize = 0x370;
+const APIC_TMICT: usize = 0x380;
+const APIC_TDCR: usize = 0x3e0;
+const APIC_LVT_MASKED: u32 = 1 << 16;
+const APIC_SPIV_APIC_ENABLED: u32 = 1 << 8;
+const APIC_VERSION: u32 = 0x14;
+const APIC_MAX_LVT_INDEX: u32 = 6;
+const POSTED_INTERRUPT_SYNC_TRACE_LIMIT: usize = 128;
+const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
+
+static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum VmCpuMode {
@@ -78,6 +111,10 @@ pub struct VmxVcpu<H: AxVCpuHal> {
     io_bitmap: IOBitmap<H>,
     msr_bitmap: MsrBitmap<H>,
     eptp_list: EptpList<H>,
+    pi_desc: PostedInterruptDescriptor<H>,
+    posted_interrupt_enabled: bool,
+    vmx_posted_interrupt_enabled: bool,
+    virtual_apic_page: PhysFrame<H>,
 
     pending_events: VecDeque<(u8, Option<u32>)>,
     // xstate: XState,
@@ -102,6 +139,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             io_bitmap: IOBitmap::passthrough_all()?,
             msr_bitmap: MsrBitmap::passthrough_all()?,
             eptp_list: EptpList::new()?,
+            pi_desc: PostedInterruptDescriptor::new(POSTED_INTR_VECTOR)?,
+            posted_interrupt_enabled: false,
+            vmx_posted_interrupt_enabled: false,
+            virtual_apic_page: PhysFrame::alloc_zero()?,
             pending_events: VecDeque::with_capacity(8),
             xstate: XState::new(),
             entry: None,
@@ -125,6 +166,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             "VmxVcpu bind to current processor vmcs @ {:#x}",
             self.vmcs.phys_addr()
         );
+        self.pi_desc
+            .set_notification_destination(current_posted_interrupt_destination());
         unsafe {
             vmx::vmptrld(self.vmcs.phys_addr().as_usize() as u64).map_err(as_axerr)?;
         }
@@ -166,6 +209,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     /// Run the guest. It returns when a vm-exit happens and returns the vm-exit if it cannot be handled by this [`VmxVcpu`] itself.
     pub fn inner_run(&mut self) -> Option<VmxExitInfo> {
+        self.sync_posted_interrupts_to_guest().unwrap();
+
         // Inject pending events
         if self.launched {
             self.inject_pending_events().unwrap();
@@ -317,8 +362,132 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.pending_events.push_back((vector, err_code));
     }
 
+    /// Queue an external interrupt for VM-entry injection.
+    ///
+    /// APICv virtual-APIC IRR/RVI delivery is still enabled for VT-d posted
+    /// interrupt experiments, but current hardware logs show IRR/RVI may not
+    /// advance to guest ISR. Software-generated interrupts therefore keep the
+    /// older VM-entry injection path for correctness.
+    pub fn queue_virtual_interrupt(&mut self, vector: u8) {
+        self.queue_event(vector, None);
+    }
+
     pub fn has_pending_event(&self, vector: u8) -> bool {
         self.pending_events.iter().any(|(event, _)| *event == vector)
+    }
+
+    /// Host physical address of this vCPU's VMX posted-interrupt descriptor.
+    pub fn posted_interrupt_descriptor_hpa(&self) -> HostPhysAddr {
+        if self.posted_interrupt_enabled {
+            self.pi_desc.phys_addr()
+        } else {
+            HostPhysAddr::from_usize(0)
+        }
+    }
+
+    /// Posted-interrupt notification vector configured for this vCPU.
+    pub fn posted_interrupt_notification_vector(&self) -> u8 {
+        self.pi_desc.notification_vector()
+    }
+
+    fn supports_posted_interrupts(&self) -> bool {
+        self.vcpu_type == VCPUType::Guest || self.vcpu_type == VCPUType::EqParavirtGuest
+    }
+
+    fn vmx_control_allowed(capability_msr: Msr, set: u32) -> bool {
+        let cap = capability_msr.read();
+        let allowed1 = (cap >> 32) as u32;
+        (allowed1 & set) == set
+    }
+
+    fn setup_virtual_apic_page(&mut self) {
+        let apic_id = self.id as u32;
+        let x2apic_ldr = ((apic_id >> 4) << 16) | (1 << (apic_id & 0xf));
+        let page = self.virtual_apic_page.as_mut_ptr();
+
+        unsafe {
+            core::ptr::write_bytes(page, 0, crate::frame::PAGE_SIZE);
+        }
+
+        let apic_id_reg = if self.vcpu_type == VCPUType::EqParavirtGuest {
+            apic_id
+        } else {
+            apic_id << 24
+        };
+        write_virtual_apic_reg(page, APIC_ID, apic_id_reg);
+        write_virtual_apic_reg(page, APIC_LVR, APIC_VERSION | (APIC_MAX_LVT_INDEX << 16));
+        write_virtual_apic_reg(page, APIC_TASKPRI, 0);
+        write_virtual_apic_reg(page, APIC_PROCPRI, 0);
+        write_virtual_apic_reg(page, APIC_LDR, x2apic_ldr);
+        write_virtual_apic_reg(page, APIC_DFR, u32::MAX);
+        write_virtual_apic_reg(page, APIC_SPIV, APIC_SPIV_APIC_ENABLED | 0xff);
+        write_virtual_apic_reg(page, APIC_ESR, 0);
+        for offset in [
+            APIC_LVTCMCI,
+            APIC_LVTT,
+            APIC_LVTTHMR,
+            APIC_LVTPC,
+            APIC_LVT0,
+            APIC_LVT1,
+            APIC_LVTERR,
+        ] {
+            write_virtual_apic_reg(page, offset, APIC_LVT_MASKED);
+        }
+        write_virtual_apic_reg(page, APIC_TMICT, 0);
+        write_virtual_apic_reg(page, APIC_TDCR, 0);
+    }
+
+    pub fn sync_posted_interrupts_to_guest(&mut self) -> AxResult<usize> {
+        if !self.posted_interrupt_enabled {
+            return Ok(0);
+        }
+
+        let control_before = self.pi_desc.raw_control();
+        let pir_before = self.pi_desc.pending_pir_snapshot();
+        let Some(pir) = self.pi_desc.take_pending_pir() else {
+            return Ok(0);
+        };
+        let control_after = self.pi_desc.raw_control();
+
+        let queued = self.queue_posted_pir_events(&pir);
+        let page = self.virtual_apic_page.as_mut_ptr();
+        let status = VmcsGuest16::INTERRUPT_STATUS.read()?;
+        let rvi = (status & 0xff) as u8;
+        let svi = (status >> 8) as u8;
+        let tpr = read_virtual_apic_reg(page, APIC_TASKPRI);
+        let ppr = read_virtual_apic_reg(page, APIC_PROCPRI);
+        let irr = virtual_apic_reg_snapshot(page, APIC_IRR);
+        let isr = virtual_apic_reg_snapshot(page, APIC_ISR);
+        let trace_id = POSTED_INTERRUPT_SYNC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_id < POSTED_INTERRUPT_SYNC_TRACE_LIMIT {
+            info!(
+                "vCPU {} queued posted interrupts control_before={:#x} control_after={:#x} pir_before={:x?} pir={:x?} queued={} RVI={:#x} SVI={:#x} TPR={:#x} PPR={:#x} IRR={:x?} ISR={:x?}",
+                self.id, control_before, control_after, pir_before, pir, queued, rvi, svi, tpr, ppr, irr, isr
+            );
+        } else {
+            trace!(
+                "vCPU {} queued posted interrupts from PIR count={}",
+                self.id, queued
+            );
+        }
+        Ok(queued)
+    }
+
+    fn queue_posted_pir_events(&mut self, pir: &[u32; 8]) -> usize {
+        let mut queued = 0;
+        for idx in (0..pir.len()).rev() {
+            let mut bits = pir[idx];
+            while bits != 0 {
+                let bit = 31usize - bits.leading_zeros() as usize;
+                let vector = (idx * 32 + bit) as u8;
+                if !self.has_pending_event(vector) {
+                    self.queue_event(vector, None);
+                    queued += 1;
+                }
+                bits &= !(1u32 << bit);
+            }
+        }
+        queued
     }
 
     /// If enable, a VM exit occurs at the beginning of any instruction if
@@ -638,7 +807,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuestNW::PENDING_DBG_EXCEPTIONS.write(0)?;
 
         VmcsGuest64::LINK_PTR.write(u64::MAX)?;
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
 
         debug!("Guest IA32_PAT {:#x}", ctx.pat);
         debug!("Guest IA32_EFER {:#x}", ctx.efer.bits());
@@ -820,15 +989,64 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         // Intercept NMI and external interrupts.
         use super::vmcs::controls::*;
         use PinbasedControls as PinCtrl;
+        use PrimaryControls as CpuCtrl;
+        use SecondaryControls as CpuCtrl2;
         let raw_cpuid = CpuId::new();
+        self.posted_interrupt_enabled = false;
+        self.vmx_posted_interrupt_enabled = false;
+
+        let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
+        let posted_interrupt_descriptor_supported = self.supports_posted_interrupts();
+        let use_vmx_posted_interrupt_delivery = posted_interrupt_descriptor_supported;
+        let mut posted_interrupt_secondary_controls =
+            CpuCtrl2::VIRTUALIZE_APIC_REGISTER | CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY;
+        if needs_x2apic_virtualization {
+            posted_interrupt_secondary_controls |= CpuCtrl2::VIRTUALIZE_X2APIC;
+        }
+
+        let posted_interrupt_controls_supported = use_vmx_posted_interrupt_delivery
+            && Self::vmx_control_allowed(
+                Msr::IA32_VMX_TRUE_PINBASED_CTLS,
+                PinCtrl::POSTED_INTERRUPTS.bits(),
+            )
+            && Self::vmx_control_allowed(
+                Msr::IA32_VMX_TRUE_PROCBASED_CTLS,
+                CpuCtrl::USE_TPR_SHADOW.bits(),
+            )
+            && Self::vmx_control_allowed(
+                Msr::IA32_VMX_PROCBASED_CTLS2,
+                posted_interrupt_secondary_controls.bits(),
+            );
+        if use_vmx_posted_interrupt_delivery && !posted_interrupt_controls_supported {
+            warn!(
+                "vCPU {} VMX posted interrupt disabled: required APICv controls unsupported x2apic_required={}",
+                self.id, needs_x2apic_virtualization
+            );
+        }
 
         let mut pinbased_controls = if self.vcpu_type != VCPUType::Host {
-            PinCtrl::NMI_EXITING.bits()
+            (PinCtrl::EXTERNAL_INTERRUPT_EXITING | PinCtrl::NMI_EXITING).bits()
         } else {
             0 // Do not intercept NMI in for host VM now.
         };
         if self.vcpu_type == VCPUType::EqParavirtGuest {
             pinbased_controls |= PinCtrl::VMX_PREEMPTION_TIMER.bits();
+        }
+        if posted_interrupt_controls_supported {
+            self.setup_virtual_apic_page();
+            pinbased_controls |= PinCtrl::POSTED_INTERRUPTS.bits();
+            VmcsControl16::POSTED_INTERRUPT_NOTIFICATION_VECTOR
+                .write(self.pi_desc.notification_vector() as u16)?;
+            VmcsControl64::POSTED_INTERRUPT_DESC_ADDR
+                .write(self.pi_desc.phys_addr().as_usize() as u64)?;
+            VmcsControl64::VIRT_APIC_ADDR
+                .write(self.virtual_apic_page.start_paddr().as_usize() as u64)?;
+            VmcsControl64::EOI_EXIT0.write(0)?;
+            VmcsControl64::EOI_EXIT1.write(0)?;
+            VmcsControl64::EOI_EXIT2.write(0)?;
+            VmcsControl64::EOI_EXIT3.write(0)?;
+            VmcsGuest16::INTERRUPT_STATUS.write(0)?;
+            VmcsControl32::TPR_THRESHOLD.write(0)?;
         }
 
         vmcs::set_control(
@@ -841,9 +1059,11 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
         // disable CR3 load/store interception.
-        use PrimaryControls as CpuCtrl;
         let mut val =
             CpuCtrl::USE_IO_BITMAPS | CpuCtrl::USE_MSR_BITMAPS | CpuCtrl::SECONDARY_CONTROLS;
+        if posted_interrupt_controls_supported {
+            val |= CpuCtrl::USE_TPR_SHADOW;
+        }
         if self.vcpu_type == VCPUType::EqParavirtGuest {
             val |= CpuCtrl::TERTIARY_CONTROLS;
         }
@@ -860,9 +1080,11 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         )?;
 
         // Enable EPT, RDTSCP, INVPCID, and unrestricted guest.
-        use SecondaryControls as CpuCtrl2;
         let mut val =
             CpuCtrl2::ENABLE_EPT | CpuCtrl2::UNRESTRICTED_GUEST | CpuCtrl2::ENABLE_VM_FUNCTIONS;
+        if posted_interrupt_controls_supported {
+            val |= posted_interrupt_secondary_controls;
+        }
 
         if let Some(features) = raw_cpuid.get_extended_processor_and_feature_identifiers() {
             if features.has_rdtscp() {
@@ -895,6 +1117,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             val.bits(),
             0,
         )?;
+        self.posted_interrupt_enabled = posted_interrupt_descriptor_supported;
+        self.vmx_posted_interrupt_enabled = posted_interrupt_controls_supported;
+        if self.posted_interrupt_enabled {
+            info!(
+                "vCPU {} posted interrupt descriptor armed nv={:#x} pi_desc={:#x} vmx_auto_delivery={} x2apic_virtualized={}",
+                self.id,
+                self.pi_desc.notification_vector(),
+                self.pi_desc.phys_addr().as_usize(),
+                self.vmx_posted_interrupt_enabled,
+                posted_interrupt_controls_supported && needs_x2apic_virtualization
+            );
+        }
 
         // Set tertiary processor-based controls.
         if self.vcpu_type == VCPUType::EqParavirtGuest {
@@ -933,6 +1167,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             0,
         )?;
 
+        // Load guest IA32_PAT/IA32_EFER on VM entry.
+        use EntryControls as EntryCtrl;
         let mut val = EntryCtrl::LOAD_IA32_PAT | EntryCtrl::LOAD_IA32_EFER;
 
         if self.vcpu_type != VCPUType::Guest {
@@ -942,8 +1178,6 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             val |= EntryCtrl::IA32E_MODE_GUEST;
         }
 
-        // Load guest IA32_PAT/IA32_EFER on VM entry.
-        use EntryControls as EntryCtrl;
         vmcs::set_control(
             VmcsControl32::VMENTRY_CONTROLS,
             Msr::IA32_VMX_TRUE_ENTRY_CTLS,
@@ -1539,6 +1773,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Specifically, the timer counts down by 1 every time bit X in the TSC changes due to a TSC increment.
         The value of X is in the range 0–31 and can be determined by consulting the VMX capability MSR IA32_VMX_MISC (see Appendix A.6).
          */
+        let queued = self.sync_posted_interrupts_to_guest()?;
+        let trace_id = VMX_PREEMPTION_TIMER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if queued > 0 || trace_id < VMX_PREEMPTION_TIMER_TRACE_LIMIT {
+            info!(
+                "vCPU {} VMX preemption timer exit queued_posted={}",
+                self.id, queued
+            );
+        }
         VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
         Ok(())
     }
@@ -1769,6 +2011,46 @@ fn get_tr_base(tr: SegmentSelector, gdt: &DescriptorTablePointer<u64>) -> u64 {
     }
 }
 
+fn current_posted_interrupt_destination() -> u32 {
+    let cpuid = CpuId::new();
+    let x2apic_enabled = (Msr::IA32_APICBASE.read() & (1 << 10)) != 0;
+    if x2apic_enabled {
+        cpuid
+            .get_extended_topology_info()
+            .and_then(|topo| topo.last().map(|level| level.x2apic_id()))
+            .or_else(|| {
+                cpuid
+                    .get_feature_info()
+                    .map(|finfo| finfo.initial_local_apic_id() as u32)
+            })
+            .unwrap_or(0)
+    } else {
+        let apic_id = cpuid
+            .get_feature_info()
+            .map(|finfo| finfo.initial_local_apic_id() as u32)
+            .unwrap_or(0);
+        (apic_id << 8) & 0xff00
+    }
+}
+
+fn write_virtual_apic_reg(page: *mut u8, offset: usize, value: u32) {
+    unsafe {
+        (page.add(offset) as *mut u32).write_volatile(value);
+    }
+}
+
+fn read_virtual_apic_reg(page: *mut u8, offset: usize) -> u32 {
+    unsafe { (page.add(offset) as *const u32).read_volatile() }
+}
+
+fn virtual_apic_reg_snapshot(page: *mut u8, base: usize) -> [u32; 8] {
+    let mut regs = [0u32; 8];
+    for (idx, reg) in regs.iter_mut().enumerate() {
+        *reg = read_virtual_apic_reg(page, base + idx * 0x10);
+    }
+    regs
+}
+
 impl<H: AxVCpuHal> Debug for VmxVcpu<H> {
     fn fmt(&self, f: &mut Formatter) -> Result {
         (|| -> AxResult<Result> {
@@ -1989,6 +2271,12 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                         AxVCpuExitReason::NestedPageFault {
                             addr: ept_info.fault_guest_paddr,
                             access_flags: ept_info.access_flags,
+                        }
+                    }
+                    VmxExitReason::EXTERNAL_INTERRUPT => {
+                        let intr_info = self.interrupt_exit_info()?;
+                        AxVCpuExitReason::ExternalInterrupt {
+                            vector: intr_info.vector as u64,
                         }
                     }
                     VmxExitReason::TRIPLE_FAULT => {

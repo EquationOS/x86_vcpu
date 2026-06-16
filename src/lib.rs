@@ -28,6 +28,7 @@ cfg_if::cfg_if! {
         use vmx as vender;
         pub use vmx::{VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo};
         pub use vmx::invalid_ept;
+        pub use vmx::POSTED_INTR_VECTOR;
 
         pub use vender::VmxArchVCpu;
         pub use vender::VmxArchPerCpuState;

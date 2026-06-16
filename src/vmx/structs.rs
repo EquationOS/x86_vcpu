@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+
 use bit_field::BitField;
 use bitflags::bitflags;
 
@@ -7,6 +9,15 @@ use axvcpu::AxVCpuHal;
 
 use crate::frame::PhysFrame;
 use crate::msr::{Msr, MsrReadWrite};
+
+/// VMX posted-interrupt notification vector reserved by EqVisor.
+///
+/// The host interrupt-remapping layer receives this vector through
+/// `struct vcpu_data` and writes it into the IRTE when enabling VT-d PI.
+///
+/// Keep it away from ArceOS host APIC vectors 0xf0..0xf3 and the Equation
+/// guest timer vector 0xf5.
+pub const POSTED_INTR_VECTOR: u8 = 0xf4;
 
 /// VMCS/VMXON region in 4K size. (SDM Vol. 3C, Section 24.2)
 #[derive(Debug)]
@@ -33,6 +44,96 @@ impl<H: AxVCpuHal> VmxRegion<H> {
 
     pub fn phys_addr(&self) -> HostPhysAddr {
         self.frame.start_paddr()
+    }
+}
+
+/// Intel VMX posted-interrupt descriptor.
+///
+/// Layout follows Linux KVM's `struct pi_desc` and Intel SDM Vol. 3C,
+/// 29.6.1. The descriptor must be 64-byte aligned; a full frame keeps the
+/// allocation simple and satisfies the alignment requirement.
+#[derive(Debug)]
+pub struct PostedInterruptDescriptor<H: AxVCpuHal> {
+    frame: PhysFrame<H>,
+}
+
+impl<H: AxVCpuHal> PostedInterruptDescriptor<H> {
+    const POSTED_INTR_ON: u64 = 1 << 0;
+    const NOTIFICATION_VECTOR_SHIFT: u64 = 16;
+    const NOTIFICATION_VECTOR_MASK: u64 = 0xff << Self::NOTIFICATION_VECTOR_SHIFT;
+    const NOTIFICATION_DESTINATION_SHIFT: u64 = 32;
+    const NOTIFICATION_DESTINATION_MASK: u64 = 0xffff_ffffu64
+        << Self::NOTIFICATION_DESTINATION_SHIFT;
+
+    pub fn new(notification_vector: u8) -> AxResult<Self> {
+        let frame = PhysFrame::alloc_zero()?;
+        Self::control_word(&frame).store(
+            (notification_vector as u64) << Self::NOTIFICATION_VECTOR_SHIFT,
+            Ordering::Release,
+        );
+        Ok(Self { frame })
+    }
+
+    pub fn phys_addr(&self) -> HostPhysAddr {
+        self.frame.start_paddr()
+    }
+
+    pub fn notification_vector(&self) -> u8 {
+        ((self.control().load(Ordering::Acquire) & Self::NOTIFICATION_VECTOR_MASK)
+            >> Self::NOTIFICATION_VECTOR_SHIFT) as u8
+    }
+
+    pub fn raw_control(&self) -> u64 {
+        self.control().load(Ordering::Acquire)
+    }
+
+    pub fn pending_pir_snapshot(&self) -> [u32; 8] {
+        let pir_base = self.frame.as_mut_ptr() as *const AtomicU32;
+        let mut pir = [0u32; 8];
+        for (idx, entry) in pir.iter_mut().enumerate() {
+            *entry = unsafe { (&*pir_base.add(idx)).load(Ordering::Acquire) };
+        }
+        pir
+    }
+
+    pub fn set_notification_destination(&self, apic_id: u32) {
+        let control = self.control();
+        let mut old = control.load(Ordering::Acquire);
+        loop {
+            let new = (old & !Self::NOTIFICATION_DESTINATION_MASK)
+                | ((apic_id as u64) << Self::NOTIFICATION_DESTINATION_SHIFT);
+            match control.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(value) => old = value,
+            }
+        }
+    }
+
+    pub fn take_pending_pir(&self) -> Option<[u32; 8]> {
+        let control = self.control();
+        let old_control = control.fetch_and(!Self::POSTED_INTR_ON, Ordering::AcqRel);
+        if old_control & Self::POSTED_INTR_ON == 0 {
+            return None;
+        }
+        fence(Ordering::SeqCst);
+
+        let pir_base = self.frame.as_mut_ptr() as *const AtomicU32;
+        let mut pir = [0u32; 8];
+        let mut pending = false;
+        for (idx, entry) in pir.iter_mut().enumerate() {
+            *entry = unsafe { (&*pir_base.add(idx)).swap(0, Ordering::AcqRel) };
+            pending |= *entry != 0;
+        }
+
+        pending.then_some(pir)
+    }
+
+    fn control(&self) -> &AtomicU64 {
+        Self::control_word(&self.frame)
+    }
+
+    fn control_word(frame: &PhysFrame<H>) -> &AtomicU64 {
+        unsafe { &*(frame.as_mut_ptr().add(32) as *const AtomicU64) }
     }
 }
 
