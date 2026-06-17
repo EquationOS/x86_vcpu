@@ -29,6 +29,7 @@ cfg_if::cfg_if! {
         pub use vmx::{VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo};
         pub use vmx::invalid_ept;
         pub use vmx::POSTED_INTR_VECTOR;
+        pub use vmx::{EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_TIMER, EquationPvAbi};
 
         pub use vender::VmxArchVCpu;
         pub use vender::VmxArchPerCpuState;

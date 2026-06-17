@@ -80,6 +80,19 @@ const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
 static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+pub const EQUATION_PV_FEATURE_TIMER: u32 = 1 << 0;
+pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EquationPvAbi {
+    pub features: u32,
+    pub cede_trampoline_va: u64,
+    pub current_vcpu_rsp_slot_gpa: u64,
+    pub gate_vcpu_rsp_slot_va: u64,
+    pub gate_eptp_index: u32,
+    pub cede_vector: u8,
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum VmCpuMode {
     Real,
@@ -126,6 +139,7 @@ pub struct VmxVcpu<H: AxVCpuHal> {
     vcpu_type: VCPUType,
 
     tsc_adjust: u64,
+    equation_pv_abi: EquationPvAbi,
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
@@ -150,6 +164,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             id,
             vcpu_type: VCPUType::UnInitialized,
             tsc_adjust: 0,
+            equation_pv_abi: EquationPvAbi::default(),
         };
         debug!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr(),);
         Ok(vcpu)
@@ -374,6 +389,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     pub fn has_pending_event(&self, vector: u8) -> bool {
         self.pending_events.iter().any(|(event, _)| *event == vector)
+    }
+
+    pub fn set_equation_pv_abi(&mut self, abi: EquationPvAbi) {
+        self.equation_pv_abi = abi;
     }
 
     /// Host physical address of this vCPU's VMX posted-interrupt descriptor.
@@ -1905,12 +1924,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ecx: vendor_regs[1],
                 edx: vendor_regs[2],
             },
-            LEAF_HYPERVISOR_FEATURE => CpuIdResult {
-                eax: 0,
-                ebx: 0,
-                ecx: 0,
-                edx: 0,
-            },
+            LEAF_HYPERVISOR_FEATURE => self.equation_hypervisor_feature_cpuid(regs_clone.rcx as u32),
             EAX_FREQUENCY_INFO => {
                 /// Timer interrupt frequencyin Hz.
                 /// Todo: this should be the same as `axconfig::TIMER_FREQUENCY` defined in ArceOS's config file.
@@ -1941,6 +1955,32 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.advance_rip(VM_EXIT_INSTR_LEN_CPUID)?;
 
         Ok(())
+    }
+
+    fn equation_hypervisor_feature_cpuid(&self, subleaf: u32) -> raw_cpuid::CpuIdResult {
+        use raw_cpuid::CpuIdResult;
+
+        let abi = self.equation_pv_abi;
+        match subleaf {
+            0 => CpuIdResult {
+                eax: abi.features,
+                ebx: abi.cede_trampoline_va as u32,
+                ecx: (abi.cede_trampoline_va >> 32) as u32,
+                edx: (abi.gate_eptp_index & 0xffff) | ((abi.cede_vector as u32) << 16),
+            },
+            1 => CpuIdResult {
+                eax: abi.current_vcpu_rsp_slot_gpa as u32,
+                ebx: (abi.current_vcpu_rsp_slot_gpa >> 32) as u32,
+                ecx: abi.gate_vcpu_rsp_slot_va as u32,
+                edx: (abi.gate_vcpu_rsp_slot_va >> 32) as u32,
+            },
+            _ => CpuIdResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+        }
     }
 
     fn handle_xsetbv(&mut self) -> AxResult {
