@@ -1061,7 +1061,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
         let posted_interrupt_descriptor_supported = self.supports_posted_interrupts();
-        let use_vmx_posted_interrupt_delivery = posted_interrupt_descriptor_supported;
+        let use_vmx_posted_interrupt_delivery =
+            posted_interrupt_descriptor_supported && !cfg!(feature = "microvm-vfio-posted-exit");
         let mut posted_interrupt_secondary_controls =
             CpuCtrl2::VIRTUALIZE_APIC_REGISTER | CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY;
         if needs_x2apic_virtualization {
@@ -1185,12 +1186,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.vmx_posted_interrupt_enabled = posted_interrupt_controls_supported;
         if self.posted_interrupt_enabled {
             info!(
-                "vCPU {} posted interrupt descriptor armed nv={:#x} pi_desc={:#x} vmx_auto_delivery={} x2apic_virtualized={}",
+                "vCPU {} posted interrupt descriptor armed nv={:#x} pi_desc={:#x} vmx_auto_delivery={} x2apic_virtualized={} posted_exit_mode={}",
                 self.id,
                 self.pi_desc.notification_vector(),
                 self.pi_desc.phys_addr().as_usize(),
                 self.vmx_posted_interrupt_enabled,
-                posted_interrupt_controls_supported && needs_x2apic_virtualization
+                posted_interrupt_controls_supported && needs_x2apic_virtualization,
+                cfg!(feature = "microvm-vfio-posted-exit")
             );
         }
 

@@ -35,3 +35,4 @@ axvcpu = { git = "https://github.com/arceos-hypervisor/axvcpu.git" }
 default = ["vmx"]
 vmx = []
 amd = []
+microvm-vfio-posted-exit = []
