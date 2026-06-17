@@ -46,6 +46,8 @@ use crate::segmentation::{Segment, SegmentAccessRights};
 use crate::xstate::XState;
 use crate::{msr::Msr, regs::GeneralRegisters};
 
+pub type PendingEvent = (u8, Option<u32>);
+
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 2_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
@@ -76,9 +78,11 @@ const APIC_VERSION: u32 = 0x14;
 const APIC_MAX_LVT_INDEX: u32 = 6;
 const POSTED_INTERRUPT_SYNC_TRACE_LIMIT: usize = 128;
 const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
+const VM_ENTRY_INJECTION_TRACE_LIMIT: usize = 512;
 
 static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub const EQUATION_PV_FEATURE_TIMER: u32 = 1 << 0;
 pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
@@ -387,6 +391,38 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.queue_event(vector, None);
     }
 
+    /// Queue an external interrupt ahead of lower-priority pending events.
+    ///
+    /// This is used by VFIO in microVM colocation mode: device interrupts are
+    /// tied to the currently running guest instance, while cede/timer events can
+    /// move execution back to eqgate before the device interrupt is injected.
+    pub fn queue_virtual_interrupt_front(&mut self, vector: u8) {
+        self.pending_events.push_front((vector, None));
+    }
+
+    pub fn pending_event_count(&self) -> usize {
+        self.pending_events.len()
+    }
+
+    pub fn take_pending_events(&mut self) -> VecDeque<PendingEvent> {
+        core::mem::take(&mut self.pending_events)
+    }
+
+    pub fn replace_pending_events(&mut self, mut events: VecDeque<PendingEvent>) {
+        core::mem::swap(&mut self.pending_events, &mut events);
+    }
+
+    pub fn pending_interrupt_ready(&mut self) -> AxResult<bool> {
+        let rflags = VmcsGuestNW::RFLAGS.read()?;
+        let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read()?;
+        let ready = rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
+            && block_state == 0;
+        if !ready {
+            self.set_interrupt_window(true)?;
+        }
+        Ok(ready)
+    }
+
     pub fn has_pending_event(&self, vector: u8) -> bool {
         self.pending_events.iter().any(|(event, _)| *event == vector)
     }
@@ -407,6 +443,15 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// Posted-interrupt notification vector configured for this vCPU.
     pub fn posted_interrupt_notification_vector(&self) -> u8 {
         self.pi_desc.notification_vector()
+    }
+
+    /// Posted-interrupt notification destination configured for this vCPU.
+    pub fn posted_interrupt_notification_destination(&self) -> Option<u32> {
+        if self.posted_interrupt_enabled {
+            Some(self.pi_desc.notification_destination())
+        } else {
+            None
+        }
     }
 
     fn supports_posted_interrupts(&self) -> bool {
@@ -1584,7 +1629,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -1596,7 +1641,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -1604,7 +1649,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -1635,18 +1680,45 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
         if let Some(event) = self.pending_events.front() {
+            let vector = event.0;
+            let pending_before = self.pending_events.len();
+            let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
+            let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
+            let allow_interrupt = rflags as u64
+                & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits()
+                != 0
+                && block_state == 0;
             // debug!(
             //     "inject_pending_events vector {:#x} allow_int {}",
             //     event.0,
             //     self.allow_interrupt()
             // );
-            if event.0 < 32 || self.allow_interrupt() {
+            if vector < 32 || allow_interrupt {
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
-                vmcs::inject_event(event.0, event.1)?;
+                vmcs::inject_event(vector, event.1)?;
                 self.pending_events.pop_front();
+                let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
+                    info!(
+                        "vCPU {} VM-entry inject vector={:#x} pending_before={} pending_after={} rflags={:#x} block_state={:#x}",
+                        self.id,
+                        vector,
+                        pending_before,
+                        self.pending_events.len(),
+                        rflags,
+                        block_state
+                    );
+                }
             } else {
                 // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
+                let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
+                    info!(
+                        "vCPU {} VM-entry interrupt blocked vector={:#x} pending={} rflags={:#x} block_state={:#x}",
+                        self.id, vector, pending_before, rflags, block_state
+                    );
+                }
             }
         }
         Ok(())
@@ -2051,7 +2123,7 @@ fn get_tr_base(tr: SegmentSelector, gdt: &DescriptorTablePointer<u64>) -> u64 {
     }
 }
 
-fn current_posted_interrupt_destination() -> u32 {
+pub fn current_posted_interrupt_destination() -> u32 {
     let cpuid = CpuId::new();
     let x2apic_enabled = (Msr::IA32_APICBASE.read() & (1 << 10)) != 0;
     if x2apic_enabled {

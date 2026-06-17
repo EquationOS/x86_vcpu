@@ -83,6 +83,11 @@ impl<H: AxVCpuHal> PostedInterruptDescriptor<H> {
             >> Self::NOTIFICATION_VECTOR_SHIFT) as u8
     }
 
+    pub fn notification_destination(&self) -> u32 {
+        ((self.control().load(Ordering::Acquire) & Self::NOTIFICATION_DESTINATION_MASK)
+            >> Self::NOTIFICATION_DESTINATION_SHIFT) as u32
+    }
+
     pub fn raw_control(&self) -> u64 {
         self.control().load(Ordering::Acquire)
     }
@@ -115,6 +120,22 @@ impl<H: AxVCpuHal> PostedInterruptDescriptor<H> {
         if old_control & Self::POSTED_INTR_ON == 0 {
             return None;
         }
+        fence(Ordering::SeqCst);
+
+        let pir_base = self.frame.as_mut_ptr() as *const AtomicU32;
+        let mut pir = [0u32; 8];
+        let mut pending = false;
+        for (idx, entry) in pir.iter_mut().enumerate() {
+            *entry = unsafe { (&*pir_base.add(idx)).swap(0, Ordering::AcqRel) };
+            pending |= *entry != 0;
+        }
+
+        pending.then_some(pir)
+    }
+
+    pub fn take_pending_pir_any(&self) -> Option<[u32; 8]> {
+        let control = self.control();
+        control.fetch_and(!Self::POSTED_INTR_ON, Ordering::AcqRel);
         fence(Ordering::SeqCst);
 
         let pir_base = self.frame.as_mut_ptr() as *const AtomicU32;
