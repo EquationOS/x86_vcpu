@@ -12,8 +12,8 @@ pub use self::definitions::VmxExitReason;
 pub use self::percpu::VmxPerCpuState as VmxArchPerCpuState;
 pub use self::structs::{POSTED_INTR_VECTOR, PostedInterruptDescriptor};
 pub use self::vcpu::{
-    EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_TIMER, EquationPvAbi, VmxVcpu as VmxArchVCpu,
-    PendingEvent, current_posted_interrupt_destination,
+    EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER, EquationPvAbi,
+    PendingEvent, VmxVcpu as VmxArchVCpu, current_posted_interrupt_destination,
 };
 pub use self::vmcs::{VmxExitInfo, VmxInterruptInfo, VmxIoExitInfo};
 

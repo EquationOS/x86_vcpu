@@ -86,15 +86,20 @@ static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub const EQUATION_PV_FEATURE_TIMER: u32 = 1 << 0;
 pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
+pub const EQUATION_PV_FEATURE_SMP: u32 = 1 << 2;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EquationPvAbi {
     pub features: u32,
     pub cede_trampoline_va: u64,
     pub current_vcpu_rsp_slot_gpa: u64,
+    pub vcpu_rsp_slot_base_gpa: u64,
+    pub vcpu_rsp_slot_stride: u64,
     pub gate_vcpu_rsp_slot_va: u64,
     pub gate_eptp_index: u32,
     pub cede_vector: u8,
+    pub current_vcpu_id: u32,
+    pub vcpu_count: u32,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -317,6 +322,21 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuestNW::RSP.write(rsp).unwrap()
     }
 
+    /// Guest page-table root. (`CR3`)
+    pub fn guest_cr3(&self) -> AxResult<usize> {
+        VmcsGuestNW::CR3.read()
+    }
+
+    /// Guest control register 4. (`CR4`)
+    pub fn guest_cr4(&self) -> AxResult<usize> {
+        VmcsGuestNW::CR4.read()
+    }
+
+    /// Guest extended feature register. (`IA32_EFER`)
+    pub fn guest_efer(&self) -> AxResult<u64> {
+        VmcsGuest64::IA32_EFER.read()
+    }
+
     /// Get Translate guest page table info
     pub fn get_pagetable_walk_info(&self) -> GuestPageWalkInfo {
         let cr3 = VmcsGuestNW::CR3.read().unwrap();
@@ -429,6 +449,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     pub fn set_equation_pv_abi(&mut self, abi: EquationPvAbi) {
         self.equation_pv_abi = abi;
+        if self.vcpu_type == VCPUType::EqParavirtGuest && self.posted_interrupt_enabled {
+            self.update_virtual_apic_id(abi.current_vcpu_id);
+        }
     }
 
     /// Host physical address of this vCPU's VMX posted-interrupt descriptor.
@@ -465,13 +488,17 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     }
 
     fn setup_virtual_apic_page(&mut self) {
-        let apic_id = self.id as u32;
+        let apic_id = if self.vcpu_type == VCPUType::EqParavirtGuest {
+            self.equation_pv_abi.current_vcpu_id
+        } else {
+            self.id as u32
+        };
+        self.update_virtual_apic_id(apic_id);
+    }
+
+    fn update_virtual_apic_id(&mut self, apic_id: u32) {
         let x2apic_ldr = ((apic_id >> 4) << 16) | (1 << (apic_id & 0xf));
         let page = self.virtual_apic_page.as_mut_ptr();
-
-        unsafe {
-            core::ptr::write_bytes(page, 0, crate::frame::PAGE_SIZE);
-        }
 
         let apic_id_reg = if self.vcpu_type == VCPUType::EqParavirtGuest {
             apic_id
@@ -479,10 +506,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             apic_id << 24
         };
         write_virtual_apic_reg(page, APIC_ID, apic_id_reg);
+        write_virtual_apic_reg(page, APIC_LDR, x2apic_ldr);
+    }
+
+    fn setup_virtual_apic_page_defaults(&mut self) {
+        let page = self.virtual_apic_page.as_mut_ptr();
+
+        unsafe {
+            core::ptr::write_bytes(page, 0, crate::frame::PAGE_SIZE);
+        }
+
         write_virtual_apic_reg(page, APIC_LVR, APIC_VERSION | (APIC_MAX_LVT_INDEX << 16));
         write_virtual_apic_reg(page, APIC_TASKPRI, 0);
         write_virtual_apic_reg(page, APIC_PROCPRI, 0);
-        write_virtual_apic_reg(page, APIC_LDR, x2apic_ldr);
         write_virtual_apic_reg(page, APIC_DFR, u32::MAX);
         write_virtual_apic_reg(page, APIC_SPIV, APIC_SPIV_APIC_ENABLED | 0xff);
         write_virtual_apic_reg(page, APIC_ESR, 0);
@@ -499,6 +535,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
         write_virtual_apic_reg(page, APIC_TMICT, 0);
         write_virtual_apic_reg(page, APIC_TDCR, 0);
+        self.setup_virtual_apic_page();
     }
 
     pub fn sync_posted_interrupts_to_guest(&mut self) -> AxResult<usize> {
@@ -1098,7 +1135,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             pinbased_controls |= PinCtrl::VMX_PREEMPTION_TIMER.bits();
         }
         if posted_interrupt_controls_supported {
-            self.setup_virtual_apic_page();
+            self.setup_virtual_apic_page_defaults();
             pinbased_controls |= PinCtrl::POSTED_INTERRUPTS.bits();
             VmcsControl16::POSTED_INTERRUPT_NOTIFICATION_VECTOR
                 .write(self.pi_desc.notification_vector() as u16)?;
@@ -2047,6 +2084,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ebx: (abi.current_vcpu_rsp_slot_gpa >> 32) as u32,
                 ecx: abi.gate_vcpu_rsp_slot_va as u32,
                 edx: (abi.gate_vcpu_rsp_slot_va >> 32) as u32,
+            },
+            2 => CpuIdResult {
+                eax: abi.current_vcpu_id,
+                ebx: abi.vcpu_count,
+                ecx: abi.vcpu_rsp_slot_stride as u32,
+                edx: 0,
+            },
+            3 => CpuIdResult {
+                eax: abi.vcpu_rsp_slot_base_gpa as u32,
+                ebx: (abi.vcpu_rsp_slot_base_gpa >> 32) as u32,
+                ecx: 0,
+                edx: 0,
             },
             _ => CpuIdResult {
                 eax: 0,

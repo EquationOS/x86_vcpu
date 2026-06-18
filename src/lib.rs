@@ -31,7 +31,10 @@ cfg_if::cfg_if! {
         pub use vmx::{POSTED_INTR_VECTOR, PostedInterruptDescriptor};
         pub use vmx::current_posted_interrupt_destination;
         pub use vmx::PendingEvent;
-        pub use vmx::{EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_TIMER, EquationPvAbi};
+        pub use vmx::{
+            EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER,
+            EquationPvAbi,
+        };
 
         pub use vender::VmxArchVCpu;
         pub use vender::VmxArchPerCpuState;
