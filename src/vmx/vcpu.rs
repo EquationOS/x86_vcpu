@@ -21,6 +21,7 @@ use axaddrspace::npt::EPTPointer;
 use axaddrspace::{GuestPhysAddr, GuestVirtAddr, HostPhysAddr, MappingFlags, NestedPageFaultInfo};
 use axerrno::{AxResult, ax_err, ax_err_type};
 use axvcpu::{AccessWidth, AxArchVCpu, AxVCpuExitReason, AxVCpuHal, AxVcpuAccessGuestState};
+use spin::Mutex;
 
 use super::VmxExitInfo;
 use super::as_axerr;
@@ -87,8 +88,10 @@ static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub const EQUATION_PV_FEATURE_TIMER: u32 = 1 << 0;
 pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
 pub const EQUATION_PV_FEATURE_SMP: u32 = 1 << 2;
+pub const EQUATION_PV_FEATURE_APIC_ID: u32 = 1 << 3;
+pub const EQUATION_PV_FEATURE_IPI: u32 = 1 << 4;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
     pub features: u32,
     pub cede_trampoline_va: u64,
@@ -100,6 +103,27 @@ pub struct EquationPvAbi {
     pub cede_vector: u8,
     pub current_vcpu_id: u32,
     pub vcpu_count: u32,
+    pub current_vcpu_apic_id: u32,
+    pub vcpu_apic_ids: [u32; 64],
+}
+
+impl Default for EquationPvAbi {
+    fn default() -> Self {
+        Self {
+            features: 0,
+            cede_trampoline_va: 0,
+            current_vcpu_rsp_slot_gpa: 0,
+            vcpu_rsp_slot_base_gpa: 0,
+            vcpu_rsp_slot_stride: 0,
+            gate_vcpu_rsp_slot_va: 0,
+            gate_eptp_index: 0,
+            cede_vector: 0,
+            current_vcpu_id: 0,
+            vcpu_count: 0,
+            current_vcpu_apic_id: 0,
+            vcpu_apic_ids: [u32::MAX; 64],
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -138,7 +162,7 @@ pub struct VmxVcpu<H: AxVCpuHal> {
     vmx_posted_interrupt_enabled: bool,
     virtual_apic_page: PhysFrame<H>,
 
-    pending_events: VecDeque<(u8, Option<u32>)>,
+    pending_events: Mutex<VecDeque<(u8, Option<u32>)>>,
     // xstate: XState,
     xstate: XState,
     entry: Option<GuestPhysAddr>,
@@ -166,7 +190,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             posted_interrupt_enabled: false,
             vmx_posted_interrupt_enabled: false,
             virtual_apic_page: PhysFrame::alloc_zero()?,
-            pending_events: VecDeque::with_capacity(8),
+            pending_events: Mutex::new(VecDeque::with_capacity(8)),
             xstate: XState::new(),
             entry: None,
             ept_root: None,
@@ -398,7 +422,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// Add a virtual interrupt or exception to the pending events list,
     /// and try to inject it before later VM entries.
     pub fn queue_event(&mut self, vector: u8, err_code: Option<u32>) {
-        self.pending_events.push_back((vector, err_code));
+        self.pending_events.lock().push_back((vector, err_code));
     }
 
     /// Queue an external interrupt for VM-entry injection.
@@ -417,19 +441,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// tied to the currently running guest instance, while cede/timer events can
     /// move execution back to eqgate before the device interrupt is injected.
     pub fn queue_virtual_interrupt_front(&mut self, vector: u8) {
-        self.pending_events.push_front((vector, None));
+        self.pending_events.lock().push_front((vector, None));
     }
 
     pub fn pending_event_count(&self) -> usize {
-        self.pending_events.len()
+        self.pending_events.lock().len()
     }
 
     pub fn take_pending_events(&mut self) -> VecDeque<PendingEvent> {
-        core::mem::take(&mut self.pending_events)
+        core::mem::take(&mut *self.pending_events.lock())
     }
 
     pub fn replace_pending_events(&mut self, mut events: VecDeque<PendingEvent>) {
-        core::mem::swap(&mut self.pending_events, &mut events);
+        core::mem::swap(&mut *self.pending_events.lock(), &mut events);
     }
 
     pub fn pending_interrupt_ready(&mut self) -> AxResult<bool> {
@@ -444,13 +468,16 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     }
 
     pub fn has_pending_event(&self, vector: u8) -> bool {
-        self.pending_events.iter().any(|(event, _)| *event == vector)
+        self.pending_events
+            .lock()
+            .iter()
+            .any(|(event, _)| *event == vector)
     }
 
     pub fn set_equation_pv_abi(&mut self, abi: EquationPvAbi) {
         self.equation_pv_abi = abi;
         if self.vcpu_type == VCPUType::EqParavirtGuest && self.posted_interrupt_enabled {
-            self.update_virtual_apic_id(abi.current_vcpu_id);
+            self.update_virtual_apic_id(abi.current_vcpu_apic_id);
         }
     }
 
@@ -489,7 +516,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     fn setup_virtual_apic_page(&mut self) {
         let apic_id = if self.vcpu_type == VCPUType::EqParavirtGuest {
-            self.equation_pv_abi.current_vcpu_id
+            self.equation_pv_abi.current_vcpu_apic_id
         } else {
             self.id as u32
         };
@@ -1668,7 +1695,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -1680,7 +1707,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -1688,7 +1715,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -1718,9 +1745,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
-        if let Some(event) = self.pending_events.front() {
+        let event = self.pending_events.lock().front().copied();
+        if let Some(event) = event {
             let vector = event.0;
-            let pending_before = self.pending_events.len();
+            let pending_before = self.pending_events.lock().len();
             let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
             let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
             let allow_interrupt = rflags as u64
@@ -1735,7 +1763,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             if vector < 32 || allow_interrupt {
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
                 vmcs::inject_event(vector, event.1)?;
-                self.pending_events.pop_front();
+                {
+                    let mut pending_events = self.pending_events.lock();
+                    if pending_events.front().copied() == Some(event) {
+                        pending_events.pop_front();
+                    }
+                }
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     info!(
@@ -1743,7 +1776,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                         self.id,
                         vector,
                         pending_before,
-                        self.pending_events.len(),
+                        self.pending_events.lock().len(),
                         rflags,
                         block_state
                     );
@@ -2097,6 +2130,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ecx: 0,
                 edx: 0,
             },
+            subleaf if subleaf >= 4 => {
+                let index = (subleaf - 4) as usize;
+                CpuIdResult {
+                    eax: if index < abi.vcpu_count as usize && index < abi.vcpu_apic_ids.len() {
+                        abi.vcpu_apic_ids[index]
+                    } else {
+                        u32::MAX
+                    },
+                    ebx: index as u32,
+                    ecx: abi.current_vcpu_apic_id,
+                    edx: abi.vcpu_count,
+                }
+            }
             _ => CpuIdResult {
                 eax: 0,
                 ebx: 0,

@@ -32,8 +32,8 @@ cfg_if::cfg_if! {
         pub use vmx::current_posted_interrupt_destination;
         pub use vmx::PendingEvent;
         pub use vmx::{
-            EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER,
-            EquationPvAbi,
+            EQUATION_PV_FEATURE_APIC_ID, EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_IPI,
+            EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER, EquationPvAbi,
         };
 
         pub use vender::VmxArchVCpu;
