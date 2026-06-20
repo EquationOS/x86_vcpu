@@ -90,6 +90,7 @@ pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
 pub const EQUATION_PV_FEATURE_SMP: u32 = 1 << 2;
 pub const EQUATION_PV_FEATURE_APIC_ID: u32 = 1 << 3;
 pub const EQUATION_PV_FEATURE_IPI: u32 = 1 << 4;
+pub const EQUATION_PV_FEATURE_CPU_RESIZE: u32 = 1 << 5;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -103,6 +104,7 @@ pub struct EquationPvAbi {
     pub cede_vector: u8,
     pub current_vcpu_id: u32,
     pub vcpu_count: u32,
+    pub desired_vcpu_count: u32,
     pub current_vcpu_apic_id: u32,
     pub vcpu_apic_ids: [u32; 64],
 }
@@ -120,6 +122,7 @@ impl Default for EquationPvAbi {
             cede_vector: 0,
             current_vcpu_id: 0,
             vcpu_count: 0,
+            desired_vcpu_count: 0,
             current_vcpu_apic_id: 0,
             vcpu_apic_ids: [u32::MAX; 64],
         }
@@ -2122,7 +2125,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 eax: abi.current_vcpu_id,
                 ebx: abi.vcpu_count,
                 ecx: abi.vcpu_rsp_slot_stride as u32,
-                edx: 0,
+                edx: abi.desired_vcpu_count,
             },
             3 => CpuIdResult {
                 eax: abi.vcpu_rsp_slot_base_gpa as u32,
