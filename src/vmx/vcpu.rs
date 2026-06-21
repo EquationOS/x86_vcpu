@@ -2491,6 +2491,10 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                             vector: intr_info.vector as u64,
                         }
                     }
+                    VmxExitReason::HLT => {
+                        self.advance_rip(exit_info.exit_instruction_length as _)?;
+                        AxVCpuExitReason::Halt
+                    }
                     VmxExitReason::TRIPLE_FAULT => {
                         error!("VMX triple fault: {:#x?}", exit_info);
                         error!("VCpu {:#x?}", self);
