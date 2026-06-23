@@ -100,6 +100,7 @@ pub struct EquationPvAbi {
     pub vcpu_rsp_slot_base_gpa: u64,
     pub vcpu_rsp_slot_stride: u64,
     pub gate_vcpu_rsp_slot_va: u64,
+    pub vcpu_gate_rsp_slot_vas: [u64; 64],
     pub gate_eptp_index: u32,
     pub cede_vector: u8,
     pub current_vcpu_id: u32,
@@ -118,6 +119,7 @@ impl Default for EquationPvAbi {
             vcpu_rsp_slot_base_gpa: 0,
             vcpu_rsp_slot_stride: 0,
             gate_vcpu_rsp_slot_va: 0,
+            vcpu_gate_rsp_slot_vas: [0; 64],
             gate_eptp_index: 0,
             cede_vector: 0,
             current_vcpu_id: 0,
@@ -591,7 +593,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let isr = virtual_apic_reg_snapshot(page, APIC_ISR);
         let trace_id = POSTED_INTERRUPT_SYNC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_id < POSTED_INTERRUPT_SYNC_TRACE_LIMIT {
-            info!(
+            debug!(
                 "vCPU {} queued posted interrupts control_before={:#x} control_after={:#x} pir_before={:x?} pir={:x?} queued={} RVI={:#x} SVI={:#x} TPR={:#x} PPR={:#x} IRR={:x?} ISR={:x?}",
                 self.id, control_before, control_after, pir_before, pir, queued, rvi, svi, tpr, ppr, irr, isr
             );
@@ -1128,8 +1130,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
         let posted_interrupt_descriptor_supported = self.supports_posted_interrupts();
-        let use_vmx_posted_interrupt_delivery =
-            posted_interrupt_descriptor_supported && !cfg!(feature = "microvm-vfio-posted-exit");
+        let use_vmx_posted_interrupt_delivery = self.vcpu_type == VCPUType::EqParavirtGuest
+            && posted_interrupt_descriptor_supported
+            && !cfg!(feature = "microvm-vfio-posted-exit");
         let mut posted_interrupt_secondary_controls =
             CpuCtrl2::VIRTUALIZE_APIC_REGISTER | CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY;
         if needs_x2apic_virtualization {
@@ -1698,7 +1701,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -1710,7 +1713,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -1718,7 +1721,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -1774,7 +1777,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 }
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
-                    info!(
+                    debug!(
                         "vCPU {} VM-entry inject vector={:#x} pending_before={} pending_after={} rflags={:#x} block_state={:#x}",
                         self.id,
                         vector,
@@ -1789,7 +1792,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 self.set_interrupt_window(true)?;
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
-                    info!(
+                    debug!(
                         "vCPU {} VM-entry interrupt blocked vector={:#x} pending={} rflags={:#x} block_state={:#x}",
                         self.id, vector, pending_before, rflags, block_state
                     );
@@ -1942,7 +1945,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let queued = self.sync_posted_interrupts_to_guest()?;
         let trace_id = VMX_PREEMPTION_TIMER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if queued > 0 || trace_id < VMX_PREEMPTION_TIMER_TRACE_LIMIT {
-            info!(
+            debug!(
                 "vCPU {} VMX preemption timer exit queued_posted={}",
                 self.id, queued
             );
@@ -2133,6 +2136,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ecx: 0,
                 edx: 0,
             },
+            subleaf if subleaf >= 0x80 => {
+                let index = (subleaf - 0x80) as usize;
+                let gate_rsp_slot_va =
+                    if index < abi.vcpu_count as usize && index < abi.vcpu_gate_rsp_slot_vas.len()
+                    {
+                        abi.vcpu_gate_rsp_slot_vas[index]
+                    } else {
+                        0
+                    };
+                CpuIdResult {
+                    eax: gate_rsp_slot_va as u32,
+                    ebx: (gate_rsp_slot_va >> 32) as u32,
+                    ecx: index as u32,
+                    edx: abi.vcpu_count,
+                }
+            }
             subleaf if subleaf >= 4 => {
                 let index = (subleaf - 4) as usize;
                 CpuIdResult {
