@@ -2366,7 +2366,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -2378,7 +2378,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -2386,7 +2386,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -3062,7 +3062,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 let mut res = cpuid!(regs_clone.rax, regs_clone.rcx);
                 res.ecx &= !FEATURE_VMX;
                 res.ecx |= FEATURE_HYPERVISOR;
-                res.eax &= !FEATURE_MCE;
+                res.edx &= !FEATURE_MCE;
                 res
             }
             // See SDM Table 3-8. Information Returned by CPUID Instruction (Contd.)
