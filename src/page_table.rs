@@ -124,7 +124,7 @@ impl<PTE: GenericPTE, H: PagingHandler, EPT: EPTTranslator> GuestPageTable64<PTE
         }
         let off = size.align_offset(vaddr.into());
 
-        info!("vaddr {:?}, entry {:?}", vaddr, entry);
+        trace!("vaddr {:?}, entry {:?}", vaddr, entry);
 
         Ok((entry.paddr().add(off).into(), entry.flags(), size))
     }

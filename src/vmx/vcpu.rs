@@ -587,24 +587,20 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
     }
 
-    pub fn seed_equation_shadow_idt_from_guest_idtr(&mut self) -> AxResult {
+    pub fn seed_equation_shadow_idt_from_guest_idtr(&mut self) -> AxResult<bool> {
         if self.vcpu_type != VCPUType::EqParavirtGuest {
-            return Ok(());
+            return Ok(false);
         }
 
         let base = VmcsGuestNW::IDTR_BASE.read()? as u64;
         let limit = VmcsGuest32::IDTR_LIMIT.read()? as u16;
         if base == 0 || limit == 0 {
-            return ax_err!(
-                InvalidInput,
-                "cannot seed Equation shadow IDT from an empty VMCS guest IDTR"
-            );
+            trace!("Equation shadow IDT seed deferred: empty VMCS guest IDTR");
+            return Ok(false);
         }
         if self.eqgate_idt_base != 0 && base == self.eqgate_idt_base {
-            return ax_err!(
-                InvalidInput,
-                "cannot seed Equation shadow IDT while VMCS guest IDTR still points to eqgate"
-            );
+            trace!("Equation shadow IDT seed deferred: VMCS guest IDTR still points to eqgate");
+            return Ok(false);
         }
 
         self.sync_lidt_shadow_idt(X86DescriptorTablePointerValue {
@@ -612,7 +608,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             limit,
             base,
             byte_len: 10,
-        })
+        })?;
+        Ok(true)
     }
 
     /// Host physical address of this vCPU's VMX posted-interrupt descriptor.
@@ -660,7 +657,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     fn trace_eqgate_timer_msr_guard(&self, access: &str, msr: u32, value: u64) {
         let trace_id = EQGATE_TIMER_MSR_GUARD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if trace_id < EQGATE_TIMER_MSR_GUARD_TRACE_LIMIT {
-            info!(
+            trace!(
                 "vCPU {} eqgate non-exit timer MSR guard {} shadowed: msr={:#x} value={:#x}",
                 self.id, access, msr, value
             );
@@ -836,7 +833,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     }
 
     pub fn read_guest_memory(&self, gva: GuestVirtAddr, len: usize) -> AxResult<Vec<u8>> {
-        info!("read_guest_memory @{:?} len: {}", gva, len);
+        trace!("read_guest_memory @{:?} len: {}", gva, len);
 
         let mut content = Vec::with_capacity(len as usize);
 
@@ -865,12 +862,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 return ax_err!(BadAddress);
             }
         }
-        info!("read_guest_memory @{:?} content: {:x?}", gva, content);
+        trace!("read_guest_memory @{:?} content: {:x?}", gva, content);
         Ok(content)
     }
 
     fn write_guest_memory(&self, gva: GuestVirtAddr, content: &[u8]) -> AxResult {
-        info!("write_guest_memory @{:?} len: {}", gva, content.len());
+        trace!("write_guest_memory @{:?} len: {}", gva, content.len());
 
         let mut remained_size = content.len();
         let mut written_size = 0;
@@ -909,7 +906,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     }
 
     fn write_guest_physical_memory(&self, gpa: GuestPhysAddr, content: &[u8]) -> AxResult {
-        info!(
+        trace!(
             "write_guest_physical_memory @{:?} len: {}",
             gpa,
             content.len()
@@ -1158,7 +1155,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         )?;
         self.shadow_idt_base = ptr.base;
         self.shadow_idt_limit = ptr.limit;
-        warn!(
+        trace!(
             "VMX LIDT shadow-IDT synced vcpu={} shadow_gpa={:#x} base={:#x} limit={:#x} generation={}",
             self.id, shadow_idt_gpa, ptr.base, ptr.limit, self.shadow_idt_generation
         );
@@ -1172,7 +1169,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         VmcsGuestNW::IDTR_BASE.write(self.eqgate_idt_base as _)?;
         VmcsGuest32::IDTR_LIMIT.write(self.eqgate_idt_limit)?;
-        warn!(
+        trace!(
             "VMX eqgate guest IDTR restored vcpu={} base={:#x} limit={:#x}",
             self.id, self.eqgate_idt_base, self.eqgate_idt_limit
         );
@@ -1185,7 +1182,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             self.eqgate_idt_limit = ptr.limit as u32;
             VmcsGuestNW::IDTR_BASE.write(ptr.base as _)?;
             VmcsGuest32::IDTR_LIMIT.write(ptr.limit as _)?;
-            warn!(
+            trace!(
                 "VMX eqgate LIDT captured/restored vcpu={} base={:#x} limit={:#x}",
                 self.id, ptr.base, ptr.limit
             );
@@ -1280,7 +1277,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuestNW::TR_BASE.write(segment.base as _)?;
         VmcsGuest32::TR_LIMIT.write(segment.limit)?;
         VmcsGuest32::TR_ACCESS_RIGHTS.write(tr_access_rights)?;
-        warn!(
+        trace!(
             "VMX LTR emulated vcpu={} selector={:#x} base={:#x} limit={:#x} access={:#x}",
             self.id, selector_raw, segment.base, segment.limit, tr_access_rights
         );
@@ -1294,7 +1291,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             VmcsGuestNW::LDTR_BASE.write(0)?;
             VmcsGuest32::LDTR_LIMIT.write(0)?;
             VmcsGuest32::LDTR_ACCESS_RIGHTS.write(SegmentAccessRights::UNUSABLE.bits())?;
-            warn!("VMX LLDT null selector emulated vcpu={}", self.id);
+            trace!("VMX LLDT null selector emulated vcpu={}", self.id);
             return Ok(());
         }
 
@@ -1309,7 +1306,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuestNW::LDTR_BASE.write(segment.base as _)?;
         VmcsGuest32::LDTR_LIMIT.write(segment.limit)?;
         VmcsGuest32::LDTR_ACCESS_RIGHTS.write(segment.access_rights.bits())?;
-        warn!(
+        trace!(
             "VMX LLDT emulated vcpu={} selector={:#x} base={:#x} limit={:#x} access={:#x}",
             self.id,
             selector_raw,
@@ -2623,14 +2620,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 self.regs_mut().rax = msr_value as u64;
                 self.regs_mut().rdx = (msr_value >> 32) as u64;
 
-                info!("VMX MSR-Read Exit: MSR_IA32_APICBASE = {:#x}", msr_value);
+                trace!("VMX MSR-Read Exit: MSR_IA32_APICBASE = {:#x}", msr_value);
             }
             MSR_IA32_TSC_ADJUST => {
                 let msr_value = self.tsc_adjust;
                 self.regs_mut().rax = msr_value as u64;
                 self.regs_mut().rdx = (msr_value >> 32) as u64;
 
-                info!("VMX MSR-Read Exit: MSR_IA32_TSC_ADJUST = {:#x}", msr_value);
+                trace!("VMX MSR-Read Exit: MSR_IA32_TSC_ADJUST = {:#x}", msr_value);
             }
             MSR_IA32_XSS => {
                 let msr_value = self.sanitize_eqgate_idt_xss(self.xstate.guest_xss());
@@ -2679,7 +2676,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         exit_info: &VmxExitInfo,
     ) -> AxResult<AxVCpuExitReason> {
         let desc_info = self.descriptor_table_exit_info(exit_info)?;
-        warn!(
+        trace!(
             "VMX descriptor-table exit scaffold vcpu={} rip={:#x} len={} qualification={:#x}",
             self.id, desc_info.guest_rip, desc_info.instruction_len, desc_info.raw_qualification
         );
@@ -2703,7 +2700,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                     return Ok(AxVCpuExitReason::Halt);
                 }
             };
-            warn!(
+            trace!(
                 "VMX SGDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
                 self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
             );
@@ -2731,7 +2728,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                     return Ok(AxVCpuExitReason::Halt);
                 }
             };
-            warn!(
+            trace!(
                 "VMX SIDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
                 self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
             );
@@ -2753,7 +2750,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             };
             VmcsGuestNW::GDTR_BASE.write(ptr.base as _)?;
             VmcsGuest32::GDTR_LIMIT.write(ptr.limit as _)?;
-            warn!(
+            trace!(
                 "VMX LGDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
                 self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
             );
@@ -2781,7 +2778,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 return Ok(AxVCpuExitReason::Halt);
             }
         };
-        warn!(
+        trace!(
             "VMX LIDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
             self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
         );
@@ -2797,7 +2794,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     fn handle_ldtr_tr_exit(&mut self, exit_info: &VmxExitInfo) -> AxResult<AxVCpuExitReason> {
         let desc_info = self.descriptor_table_exit_info(exit_info)?;
-        warn!(
+        trace!(
             "VMX LDTR/TR exit scaffold vcpu={} rip={:#x} len={} qualification={:#x}",
             self.id, desc_info.guest_rip, desc_info.instruction_len, desc_info.raw_qualification
         );
