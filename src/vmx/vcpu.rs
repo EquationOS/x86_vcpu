@@ -9,6 +9,7 @@ use bit_field::BitField;
 use raw_cpuid::CpuId;
 use x86::bits64::vmx;
 use x86::dtables::{self, DescriptorTablePointer};
+use x86::msr::{rdmsr, wrmsr};
 use x86::segmentation::SegmentSelector;
 use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags, EferFlags};
@@ -28,7 +29,7 @@ use super::as_axerr;
 use super::definitions::VmxExitReason;
 use super::read_vmcs_revision_id;
 use super::structs::{
-    EptpList, IOBitmap, MsrBitmap, PostedInterruptDescriptor, VmxRegion, POSTED_INTR_VECTOR,
+    EptpList, IOBitmap, MsrBitmap, POSTED_INTR_VECTOR, PostedInterruptDescriptor, VmxRegion,
 };
 use super::vmcs::{
     self, VmcsControl16, VmcsControl32, VmcsControl64, VmcsControlNW, VmcsGuest16, VmcsGuest32,
@@ -39,7 +40,8 @@ use super::vmcs::{
 use crate::context::{GuestContext, VCpuSetupContext};
 use crate::frame::PhysFrame;
 use crate::generated::msr_index::{
-    MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_XFD, MSR_IA32_XFD_ERR, MSR_IA32_XSS,
+    MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_TSC_DEADLINE, MSR_IA32_XFD,
+    MSR_IA32_XFD_ERR, MSR_IA32_XSS,
 };
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
@@ -49,6 +51,9 @@ use crate::{msr::Msr, regs::GeneralRegisters};
 
 pub type PendingEvent = (u8, Option<u32>);
 
+#[cfg(feature = "microvm-eqgate-long-preemption-timer")]
+const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 32_000;
+#[cfg(not(feature = "microvm-eqgate-long-preemption-timer"))]
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 2_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
@@ -80,10 +85,51 @@ const APIC_MAX_LVT_INDEX: u32 = 6;
 const POSTED_INTERRUPT_SYNC_TRACE_LIMIT: usize = 128;
 const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
 const VM_ENTRY_INJECTION_TRACE_LIMIT: usize = 512;
+const ENABLE_DESCRIPTOR_TABLE_EXITING: bool = cfg!(feature = "microvm-eqgate-idt-exit");
+const ENABLE_EQGATE_NONEXIT_TIMER_EXTINT: bool =
+    cfg!(feature = "microvm-eqgate-nonexit-timer-extint");
+const ENABLE_EQGATE_NONEXIT_TIMER_MSR_GUARD: bool =
+    cfg!(feature = "microvm-eqgate-nonexit-timer-msr-guard");
+const EQGATE_TIMER_MSR_GUARD_TRACE_LIMIT: usize = 64;
+const EQGATE_KERNEL_BASE_VADDR: u64 = 0xffff_8001_0000_0000;
+const EQGATE_KERNEL_END_VADDR: u64 = 0xffff_8002_0000_0000;
+const MSR_IA32_X2APIC_LVT_TIMER: u32 = 0x832;
+const MSR_IA32_X2APIC_INIT_COUNT: u32 = 0x838;
+const MSR_IA32_X2APIC_DIV_CONF: u32 = 0x83e;
+const EQLINUX_SHADOW_IDT_RAW_SIZE: usize = 24;
+const EQLINUX_SHADOW_IDT_READY_FLAG: u32 = 1 << 0;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const CR4_CET_MASK: u64 = 1 << 23;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const CPUID_7_0_ECX_CET_SHSTK: u32 = 1 << 7;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const CPUID_7_0_EDX_CET_IBT: u32 = 1 << 20;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_CET_USER: u32 = 1 << 11;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_CET_KERNEL: u32 = 1 << 12;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_EQGATE_IDT_UNSUPPORTED: u32 = XFEATURE_CET_USER | XFEATURE_CET_KERNEL;
 
 static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EQGATE_TIMER_MSR_GUARD_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy)]
+struct VmxDescriptorTableExitInfo {
+    raw_qualification: usize,
+    guest_rip: usize,
+    instruction_len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct X86DescriptorTablePointerValue {
+    operand_gva: u64,
+    limit: u16,
+    base: u64,
+    byte_len: usize,
+}
 
 pub const EQUATION_PV_FEATURE_TIMER: u32 = 1 << 0;
 pub const EQUATION_PV_FEATURE_CEDE: u32 = 1 << 1;
@@ -91,11 +137,15 @@ pub const EQUATION_PV_FEATURE_SMP: u32 = 1 << 2;
 pub const EQUATION_PV_FEATURE_APIC_ID: u32 = 1 << 3;
 pub const EQUATION_PV_FEATURE_IPI: u32 = 1 << 4;
 pub const EQUATION_PV_FEATURE_CPU_RESIZE: u32 = 1 << 5;
+pub const EQUATION_PV_FEATURE_SHADOW_IDT: u32 = 1 << 6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
     pub features: u32,
     pub cede_trampoline_va: u64,
+    pub current_vcpu_context_gpa: u64,
+    pub shadow_idt_offset: u32,
+    pub shadow_idt_size: u32,
     pub current_vcpu_rsp_slot_gpa: u64,
     pub vcpu_rsp_slot_base_gpa: u64,
     pub vcpu_rsp_slot_stride: u64,
@@ -115,6 +165,9 @@ impl Default for EquationPvAbi {
         Self {
             features: 0,
             cede_trampoline_va: 0,
+            current_vcpu_context_gpa: 0,
+            shadow_idt_offset: 0,
+            shadow_idt_size: 0,
             current_vcpu_rsp_slot_gpa: 0,
             vcpu_rsp_slot_base_gpa: 0,
             vcpu_rsp_slot_stride: 0,
@@ -150,6 +203,28 @@ enum VCPUType {
     EqParavirtGuest,
 }
 
+#[derive(Debug, Default)]
+struct EqgateTimerMsrShadow {
+    tsc_deadline: u64,
+    x2apic_lvt_timer: u64,
+    x2apic_init_count: u64,
+    x2apic_div_conf: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmxInternalExitKind {
+    InterruptWindow,
+    PreemptionTimer,
+    Xsetbv,
+    CrAccess,
+    Cpuid,
+    ExceptionNmi,
+    MsrRead,
+    MsrWrite,
+    DescriptorTable,
+    LdtrTr,
+}
+
 /// A virtual CPU within a guest.
 #[repr(C)]
 pub struct VmxVcpu<H: AxVCpuHal> {
@@ -178,6 +253,13 @@ pub struct VmxVcpu<H: AxVCpuHal> {
 
     tsc_adjust: u64,
     equation_pv_abi: EquationPvAbi,
+    shadow_idt_generation: u32,
+    shadow_idt_base: u64,
+    shadow_idt_limit: u16,
+    eqgate_idt_base: u64,
+    eqgate_idt_limit: u32,
+    eqgate_timer_msr_shadow: EqgateTimerMsrShadow,
+    last_internal_exit_kind: Option<VmxInternalExitKind>,
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
@@ -203,6 +285,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             vcpu_type: VCPUType::UnInitialized,
             tsc_adjust: 0,
             equation_pv_abi: EquationPvAbi::default(),
+            shadow_idt_generation: 0,
+            shadow_idt_base: 0,
+            shadow_idt_limit: 0,
+            eqgate_idt_base: 0,
+            eqgate_idt_limit: 0,
+            eqgate_timer_msr_shadow: EqgateTimerMsrShadow::default(),
+            last_internal_exit_kind: None,
         };
         debug!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr(),);
         Ok(vcpu)
@@ -212,6 +301,16 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     // pub fn vcpu_id(&self) -> usize {
     //     get_current_vcpu::<Self>().unwrap().id()
     // }
+
+    pub fn take_last_internal_exit_kind(&mut self) -> Option<VmxInternalExitKind> {
+        self.last_internal_exit_kind.take()
+    }
+
+    #[inline]
+    fn internal_nothing_exit(&mut self, kind: VmxInternalExitKind) -> AxVCpuExitReason {
+        self.last_internal_exit_kind = Some(kind);
+        AxVCpuExitReason::Nothing
+    }
 
     /// Bind this [`VmxVcpu`] to current logical processor.
     pub fn bind_to_current_processor(&self) -> AxResult {
@@ -262,6 +361,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     /// Run the guest. It returns when a vm-exit happens and returns the vm-exit if it cannot be handled by this [`VmxVcpu`] itself.
     pub fn inner_run(&mut self) -> Option<VmxExitInfo> {
+        self.last_internal_exit_kind = None;
         self.sync_posted_interrupts_to_guest().unwrap();
 
         // Inject pending events
@@ -290,7 +390,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         trace!("VM exit: {:#x?}", exit_info);
 
         match self.builtin_vmexit_handler(&exit_info) {
-            Some(result) => {
+            Some((kind, result)) => {
                 if result.is_err() {
                     panic!(
                         "VmxVcpu failed to handle a VM-exit that should be handled by itself: {:?}, error {:?}, vcpu: {:#x?}",
@@ -300,6 +400,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                     );
                 }
 
+                self.last_internal_exit_kind = Some(kind);
                 None
             }
             None => Some(exit_info),
@@ -486,6 +587,34 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
     }
 
+    pub fn seed_equation_shadow_idt_from_guest_idtr(&mut self) -> AxResult {
+        if self.vcpu_type != VCPUType::EqParavirtGuest {
+            return Ok(());
+        }
+
+        let base = VmcsGuestNW::IDTR_BASE.read()? as u64;
+        let limit = VmcsGuest32::IDTR_LIMIT.read()? as u16;
+        if base == 0 || limit == 0 {
+            return ax_err!(
+                InvalidInput,
+                "cannot seed Equation shadow IDT from an empty VMCS guest IDTR"
+            );
+        }
+        if self.eqgate_idt_base != 0 && base == self.eqgate_idt_base {
+            return ax_err!(
+                InvalidInput,
+                "cannot seed Equation shadow IDT while VMCS guest IDTR still points to eqgate"
+            );
+        }
+
+        self.sync_lidt_shadow_idt(X86DescriptorTablePointerValue {
+            operand_gva: 0,
+            limit,
+            base,
+            byte_len: 10,
+        })
+    }
+
     /// Host physical address of this vCPU's VMX posted-interrupt descriptor.
     pub fn posted_interrupt_descriptor_hpa(&self) -> HostPhysAddr {
         if self.posted_interrupt_enabled {
@@ -517,6 +646,25 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let cap = capability_msr.read();
         let allowed1 = (cap >> 32) as u32;
         (allowed1 & set) == set
+    }
+
+    fn eqgate_nonexit_timer_msr_guard_active(&self) -> bool {
+        self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_EQGATE_NONEXIT_TIMER_MSR_GUARD
+    }
+
+    fn eqgate_rip_is_gate_kernel(&self, rip: u64) -> bool {
+        self.vcpu_type == VCPUType::EqParavirtGuest
+            && (EQGATE_KERNEL_BASE_VADDR..EQGATE_KERNEL_END_VADDR).contains(&rip)
+    }
+
+    fn trace_eqgate_timer_msr_guard(&self, access: &str, msr: u32, value: u64) {
+        let trace_id = EQGATE_TIMER_MSR_GUARD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_id < EQGATE_TIMER_MSR_GUARD_TRACE_LIMIT {
+            info!(
+                "vCPU {} eqgate non-exit timer MSR guard {} shadowed: msr={:#x} value={:#x}",
+                self.id, access, msr, value
+            );
+        }
     }
 
     fn setup_virtual_apic_page(&mut self) {
@@ -595,7 +743,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         if trace_id < POSTED_INTERRUPT_SYNC_TRACE_LIMIT {
             debug!(
                 "vCPU {} queued posted interrupts control_before={:#x} control_after={:#x} pir_before={:x?} pir={:x?} queued={} RVI={:#x} SVI={:#x} TPR={:#x} PPR={:#x} IRR={:x?} ISR={:x?}",
-                self.id, control_before, control_after, pir_before, pir, queued, rvi, svi, tpr, ppr, irr, isr
+                self.id,
+                control_before,
+                control_after,
+                pir_before,
+                pir,
+                queued,
+                rvi,
+                svi,
+                tpr,
+                ppr,
+                irr,
+                isr
             );
         } else {
             trace!(
@@ -604,6 +763,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             );
         }
         Ok(queued)
+    }
+
+    pub fn take_posted_interrupt_pir(&mut self) -> Option<[u32; 8]> {
+        if !self.posted_interrupt_enabled {
+            return None;
+        }
+
+        self.pi_desc.take_pending_pir()
     }
 
     fn queue_posted_pir_events(&mut self, pir: &[u32; 8]) -> usize {
@@ -638,6 +805,23 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
+    pub fn set_vmx_preemption_timer_enabled(&mut self, enable: bool) -> AxResult<bool> {
+        let mut ctrl = VmcsControl32::PINBASED_EXEC_CONTROLS.read()?;
+        let bits = vmcs::controls::PinbasedControls::VMX_PREEMPTION_TIMER.bits();
+        let was_enabled = (ctrl & bits) != 0;
+        if enable {
+            ctrl |= bits;
+            VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(VMX_PREEMPTION_TIMER_SET_VALUE)?;
+        } else {
+            ctrl &= !bits;
+            VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+        }
+        if was_enabled != enable {
+            VmcsControl32::PINBASED_EXEC_CONTROLS.write(ctrl)?;
+        }
+        Ok(was_enabled != enable)
+    }
+
     /// Set I/O intercept by modifying I/O bitmap.
     pub fn set_io_intercept_of_range(&mut self, port_base: u32, count: u32, intercept: bool) {
         self.io_bitmap
@@ -660,10 +844,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let mut addr = gva;
 
         while remained_size > 0 {
-            let (gpa, _flags, page_size) = self.guest_page_table_query(gva).map_err(|e| {
+            let (gpa, _flags, page_size) = self.guest_page_table_query(addr).map_err(|e| {
                 warn!(
                     "Failed to query guest page table, GVA {:?} err {:?}",
-                    gva, e
+                    addr, e
                 );
                 ax_err_type!(BadAddress)
             })?;
@@ -685,10 +869,86 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(content)
     }
 
-    pub fn decode_instruction(&self, rip: GuestVirtAddr, instr_len: usize) -> AxResult {
-        use alloc::string::String;
-        use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
+    fn write_guest_memory(&self, gva: GuestVirtAddr, content: &[u8]) -> AxResult {
+        info!("write_guest_memory @{:?} len: {}", gva, content.len());
 
+        let mut remained_size = content.len();
+        let mut written_size = 0;
+        let mut addr = gva;
+
+        while remained_size > 0 {
+            let (gpa, _flags, page_size) = self.guest_page_table_query(addr).map_err(|e| {
+                warn!(
+                    "Failed to query guest page table, GVA {:?} err {:?}",
+                    addr, e
+                );
+                ax_err_type!(BadAddress)
+            })?;
+            let pgoff = page_size.align_offset(addr.into());
+            let write_size = (page_size as usize - pgoff).min(remained_size);
+
+            if let Some((hpa, _flags, _pgsize)) = H::EPTTranslator::guest_phys_to_host_phys(gpa) {
+                let hva_ptr = H::PagingHandler::phys_to_virt(hpa).as_mut_ptr();
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        content[written_size..].as_ptr(),
+                        hva_ptr,
+                        write_size,
+                    );
+                }
+            } else {
+                return ax_err!(BadAddress);
+            }
+
+            addr += write_size;
+            written_size += write_size;
+            remained_size -= write_size;
+        }
+
+        Ok(())
+    }
+
+    fn write_guest_physical_memory(&self, gpa: GuestPhysAddr, content: &[u8]) -> AxResult {
+        info!(
+            "write_guest_physical_memory @{:?} len: {}",
+            gpa,
+            content.len()
+        );
+
+        let mut remained_size = content.len();
+        let mut written_size = 0;
+        let mut addr = gpa;
+
+        while remained_size > 0 {
+            let Some((hpa, _flags, page_size)) = H::EPTTranslator::guest_phys_to_host_phys(addr)
+            else {
+                warn!("Failed to translate guest physical address {:?}", addr);
+                return ax_err!(BadAddress);
+            };
+            let pgoff = page_size.align_offset(addr.into());
+            let write_size = (page_size as usize - pgoff).min(remained_size);
+            let hva_ptr = H::PagingHandler::phys_to_virt(hpa).as_mut_ptr();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    content[written_size..].as_ptr(),
+                    hva_ptr,
+                    write_size,
+                );
+            }
+            addr += write_size;
+            written_size += write_size;
+            remained_size -= write_size;
+        }
+
+        Ok(())
+    }
+
+    fn decode_guest_instruction(
+        &self,
+        rip: GuestVirtAddr,
+        instr_len: usize,
+    ) -> AxResult<iced_x86::Instruction> {
+        use iced_x86::{Decoder, DecoderOptions};
         let bytes = self.read_guest_memory(rip, instr_len)?;
         let mut decoder = Decoder::with_ip(
             64,
@@ -696,12 +956,367 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             rip.as_usize() as _,
             DecoderOptions::NONE,
         );
-        let instr = decoder.decode();
+        Ok(decoder.decode())
+    }
+
+    pub fn decode_instruction(&self, rip: GuestVirtAddr, instr_len: usize) -> AxResult {
+        use alloc::string::String;
+        use iced_x86::{Formatter, IntelFormatter};
+
+        let instr = self.decode_guest_instruction(rip, instr_len)?;
         let mut output = String::new();
         let mut formattor = IntelFormatter::new();
         formattor.format(&instr, &mut output);
 
         warn!("Decoded instruction @Intel formatter: {}", output);
+        Ok(())
+    }
+
+    fn guest_segment_base(&self, reg: iced_x86::Register) -> Option<u64> {
+        match reg {
+            iced_x86::Register::ES => VmcsGuestNW::ES_BASE.read().ok().map(|v| v as u64),
+            iced_x86::Register::CS => VmcsGuestNW::CS_BASE.read().ok().map(|v| v as u64),
+            iced_x86::Register::SS => VmcsGuestNW::SS_BASE.read().ok().map(|v| v as u64),
+            iced_x86::Register::DS => VmcsGuestNW::DS_BASE.read().ok().map(|v| v as u64),
+            iced_x86::Register::FS => VmcsGuestNW::FS_BASE.read().ok().map(|v| v as u64),
+            iced_x86::Register::GS => VmcsGuestNW::GS_BASE.read().ok().map(|v| v as u64),
+            _ => None,
+        }
+    }
+
+    fn iced_register_value(&self, reg: iced_x86::Register) -> Option<u64> {
+        use iced_x86::Register;
+
+        let regs = self.regs();
+        match reg {
+            Register::None => Some(0),
+            Register::RAX | Register::EAX | Register::AX => Some(regs.rax),
+            Register::RCX | Register::ECX | Register::CX => Some(regs.rcx),
+            Register::RDX | Register::EDX | Register::DX => Some(regs.rdx),
+            Register::RBX | Register::EBX | Register::BX => Some(regs.rbx),
+            Register::RSP | Register::ESP | Register::SP => {
+                VmcsGuestNW::RSP.read().ok().map(|v| v as u64)
+            }
+            Register::RBP | Register::EBP | Register::BP => Some(regs.rbp),
+            Register::RSI | Register::ESI | Register::SI => Some(regs.rsi),
+            Register::RDI | Register::EDI | Register::DI => Some(regs.rdi),
+            Register::R8 | Register::R8D | Register::R8W => Some(regs.r8),
+            Register::R9 | Register::R9D | Register::R9W => Some(regs.r9),
+            Register::R10 | Register::R10D | Register::R10W => Some(regs.r10),
+            Register::R11 | Register::R11D | Register::R11W => Some(regs.r11),
+            Register::R12 | Register::R12D | Register::R12W => Some(regs.r12),
+            Register::R13 | Register::R13D | Register::R13W => Some(regs.r13),
+            Register::R14 | Register::R14D | Register::R14W => Some(regs.r14),
+            Register::R15 | Register::R15D | Register::R15W => Some(regs.r15),
+            Register::RIP | Register::EIP => VmcsGuestNW::RIP.read().ok().map(|v| v as u64),
+            Register::ES
+            | Register::CS
+            | Register::SS
+            | Register::DS
+            | Register::FS
+            | Register::GS => self.guest_segment_base(reg),
+            _ => None,
+        }
+    }
+
+    fn lidt_descriptor_pointer_len(code: iced_x86::Code) -> Option<usize> {
+        match code {
+            iced_x86::Code::Lidt_m1664 => Some(10),
+            iced_x86::Code::Lidt_m1632 | iced_x86::Code::Lidt_m1632_16 => Some(6),
+            _ => None,
+        }
+    }
+
+    fn lgdt_descriptor_pointer_len(code: iced_x86::Code) -> Option<usize> {
+        match code {
+            iced_x86::Code::Lgdt_m1664 => Some(10),
+            iced_x86::Code::Lgdt_m1632 | iced_x86::Code::Lgdt_m1632_16 => Some(6),
+            _ => None,
+        }
+    }
+
+    fn sidt_descriptor_pointer_len(code: iced_x86::Code) -> Option<usize> {
+        match code {
+            iced_x86::Code::Sidt_m1664 => Some(10),
+            iced_x86::Code::Sidt_m1632 | iced_x86::Code::Sidt_m1632_16 => Some(6),
+            _ => None,
+        }
+    }
+
+    fn sgdt_descriptor_pointer_len(code: iced_x86::Code) -> Option<usize> {
+        match code {
+            iced_x86::Code::Sgdt_m1664 => Some(10),
+            iced_x86::Code::Sgdt_m1632 | iced_x86::Code::Sgdt_m1632_16 => Some(6),
+            _ => None,
+        }
+    }
+
+    fn descriptor_table_operand_gva(&self, instr: &iced_x86::Instruction) -> AxResult<u64> {
+        instr
+            .try_virtual_address(0, 0, |reg, _element_index, _element_size| {
+                self.iced_register_value(reg)
+            })
+            .ok_or_else(|| {
+                ax_err_type!(
+                    BadAddress,
+                    "failed to calculate descriptor-table operand address"
+                )
+            })
+    }
+
+    fn read_descriptor_pointer(
+        &self,
+        instr: &iced_x86::Instruction,
+        byte_len: usize,
+    ) -> AxResult<X86DescriptorTablePointerValue> {
+        let operand_gva = self.descriptor_table_operand_gva(instr)?;
+        let bytes =
+            self.read_guest_memory(GuestVirtAddr::from_usize(operand_gva as usize), byte_len)?;
+        let limit = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let base = if byte_len == 10 {
+            u64::from_le_bytes([
+                bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9],
+            ])
+        } else {
+            u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as u64
+        };
+
+        Ok(X86DescriptorTablePointerValue {
+            operand_gva,
+            limit,
+            base,
+            byte_len,
+        })
+    }
+
+    fn write_descriptor_pointer(
+        &self,
+        instr: &iced_x86::Instruction,
+        byte_len: usize,
+        base: u64,
+        limit: u16,
+    ) -> AxResult<X86DescriptorTablePointerValue> {
+        if byte_len == 6 && base > u32::MAX as u64 {
+            return ax_err!(
+                InvalidInput,
+                "descriptor-table m16&32 cannot encode 64-bit base"
+            );
+        }
+
+        let operand_gva = self.descriptor_table_operand_gva(instr)?;
+        let mut bytes = [0_u8; 10];
+        bytes[0..2].copy_from_slice(&limit.to_le_bytes());
+        if byte_len == 10 {
+            bytes[2..10].copy_from_slice(&base.to_le_bytes());
+        } else {
+            bytes[2..6].copy_from_slice(&(base as u32).to_le_bytes());
+        }
+        self.write_guest_memory(
+            GuestVirtAddr::from_usize(operand_gva as usize),
+            &bytes[..byte_len],
+        )?;
+
+        Ok(X86DescriptorTablePointerValue {
+            operand_gva,
+            limit,
+            base,
+            byte_len,
+        })
+    }
+
+    fn sync_lidt_shadow_idt(&mut self, ptr: X86DescriptorTablePointerValue) -> AxResult {
+        let abi = self.equation_pv_abi;
+        if self.vcpu_type != VCPUType::EqParavirtGuest {
+            return Ok(());
+        }
+        if (abi.features & EQUATION_PV_FEATURE_SHADOW_IDT) == 0 {
+            return Ok(());
+        }
+        if abi.current_vcpu_context_gpa == 0
+            || abi.shadow_idt_size < EQLINUX_SHADOW_IDT_RAW_SIZE as u32
+        {
+            return ax_err!(InvalidInput, "Equation shadow IDT PV ABI is incomplete");
+        }
+
+        self.shadow_idt_generation = self.shadow_idt_generation.wrapping_add(1);
+        if self.shadow_idt_generation == 0 {
+            self.shadow_idt_generation = 1;
+        }
+
+        let mut shadow_idt = [0_u8; EQLINUX_SHADOW_IDT_RAW_SIZE];
+        shadow_idt[0..8].copy_from_slice(&ptr.base.to_le_bytes());
+        shadow_idt[8..10].copy_from_slice(&ptr.limit.to_le_bytes());
+        shadow_idt[10..12].copy_from_slice(&0_u16.to_le_bytes());
+        shadow_idt[12..16].copy_from_slice(&EQLINUX_SHADOW_IDT_READY_FLAG.to_le_bytes());
+        shadow_idt[16..20].copy_from_slice(&self.shadow_idt_generation.to_le_bytes());
+        shadow_idt[20..24].copy_from_slice(&0_u32.to_le_bytes());
+
+        let shadow_idt_gpa = abi.current_vcpu_context_gpa + u64::from(abi.shadow_idt_offset);
+        self.write_guest_physical_memory(
+            GuestPhysAddr::from_usize(shadow_idt_gpa as usize),
+            &shadow_idt,
+        )?;
+        self.shadow_idt_base = ptr.base;
+        self.shadow_idt_limit = ptr.limit;
+        warn!(
+            "VMX LIDT shadow-IDT synced vcpu={} shadow_gpa={:#x} base={:#x} limit={:#x} generation={}",
+            self.id, shadow_idt_gpa, ptr.base, ptr.limit, self.shadow_idt_generation
+        );
+        Ok(())
+    }
+
+    fn restore_eqgate_guest_idtr(&self) -> AxResult {
+        if self.vcpu_type != VCPUType::EqParavirtGuest || self.eqgate_idt_base == 0 {
+            return Ok(());
+        }
+
+        VmcsGuestNW::IDTR_BASE.write(self.eqgate_idt_base as _)?;
+        VmcsGuest32::IDTR_LIMIT.write(self.eqgate_idt_limit)?;
+        warn!(
+            "VMX eqgate guest IDTR restored vcpu={} base={:#x} limit={:#x}",
+            self.id, self.eqgate_idt_base, self.eqgate_idt_limit
+        );
+        Ok(())
+    }
+
+    fn handle_lidt_descriptor_pointer(&mut self, ptr: X86DescriptorTablePointerValue) -> AxResult {
+        if self.eqgate_idt_base == 0 || ptr.base == self.eqgate_idt_base {
+            self.eqgate_idt_base = ptr.base;
+            self.eqgate_idt_limit = ptr.limit as u32;
+            VmcsGuestNW::IDTR_BASE.write(ptr.base as _)?;
+            VmcsGuest32::IDTR_LIMIT.write(ptr.limit as _)?;
+            warn!(
+                "VMX eqgate LIDT captured/restored vcpu={} base={:#x} limit={:#x}",
+                self.id, ptr.base, ptr.limit
+            );
+            return Ok(());
+        }
+
+        self.sync_lidt_shadow_idt(ptr)?;
+        self.restore_eqgate_guest_idtr()
+    }
+
+    fn selector_operand_value(&self, instr: &iced_x86::Instruction) -> AxResult<u16> {
+        match instr.op0_kind() {
+            iced_x86::OpKind::Register => self
+                .iced_register_value(instr.op0_register())
+                .map(|value| value as u16)
+                .ok_or_else(|| ax_err_type!(BadAddress, "failed to read selector register")),
+            iced_x86::OpKind::Memory => {
+                let operand_gva = self.descriptor_table_operand_gva(instr)?;
+                let bytes =
+                    self.read_guest_memory(GuestVirtAddr::from_usize(operand_gva as usize), 2)?;
+                Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+            }
+            _ => ax_err!(
+                InvalidInput,
+                "descriptor-table selector operand is neither register nor memory"
+            ),
+        }
+    }
+
+    fn read_guest_gdt_entry(&self, index: usize) -> AxResult<u64> {
+        let gdtr_base = VmcsGuestNW::GDTR_BASE.read()? as u64;
+        let gdtr_limit = VmcsGuest32::GDTR_LIMIT.read()? as usize;
+        let byte_offset = index
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or_else(|| ax_err_type!(BadAddress, "GDT selector index overflow"))?;
+        if byte_offset + core::mem::size_of::<u64>() - 1 > gdtr_limit {
+            return ax_err!(BadAddress, "GDT selector index is outside GDTR limit");
+        }
+
+        let bytes = self.read_guest_memory(
+            GuestVirtAddr::from_usize((gdtr_base as usize) + byte_offset),
+            core::mem::size_of::<u64>(),
+        )?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn guest_segment_from_selector(&self, selector: SegmentSelector) -> AxResult<Segment> {
+        if selector.bits() == 0 {
+            return Ok(Segment::invalid());
+        }
+
+        let index = selector.index() as usize;
+        let entry_value = self.read_guest_gdt_entry(index)?;
+        let access_rights = SegmentAccessRights::from_descriptor(entry_value);
+        if !access_rights.contains(SegmentAccessRights::PRESENT) {
+            return Ok(Segment::invalid());
+        }
+
+        let mut base = entry_value.get_bits(16..40) | (entry_value.get_bits(56..64) << 24);
+        let mut limit = entry_value.get_bits(0..16) | (entry_value.get_bits(48..52) << 16);
+        if !access_rights.contains(SegmentAccessRights::CODE_DATA) {
+            let high_entry = self.read_guest_gdt_entry(index + 1)?;
+            base |= high_entry << 32;
+        }
+        if access_rights.contains(SegmentAccessRights::GRANULARITY) {
+            limit = (limit << 12) | 0xfff;
+        }
+
+        Ok(Segment {
+            selector,
+            base,
+            limit: limit as u32,
+            access_rights,
+        })
+    }
+
+    fn emulate_ltr(&self, selector_raw: u16) -> AxResult {
+        let selector = SegmentSelector::from_raw(selector_raw);
+        let segment = self.guest_segment_from_selector(selector)?;
+        if segment
+            .access_rights
+            .contains(SegmentAccessRights::UNUSABLE)
+        {
+            return ax_err!(InvalidInput, "LTR selector resolves to unusable segment");
+        }
+
+        let tr_access_rights =
+            (segment.access_rights.bits() & !0xf) | SegmentAccessRights::TSS_BUSY.bits();
+        VmcsGuest16::TR_SELECTOR.write(selector.bits())?;
+        VmcsGuestNW::TR_BASE.write(segment.base as _)?;
+        VmcsGuest32::TR_LIMIT.write(segment.limit)?;
+        VmcsGuest32::TR_ACCESS_RIGHTS.write(tr_access_rights)?;
+        warn!(
+            "VMX LTR emulated vcpu={} selector={:#x} base={:#x} limit={:#x} access={:#x}",
+            self.id, selector_raw, segment.base, segment.limit, tr_access_rights
+        );
+        Ok(())
+    }
+
+    fn emulate_lldt(&self, selector_raw: u16) -> AxResult {
+        let selector = SegmentSelector::from_raw(selector_raw);
+        if selector.bits() == 0 {
+            VmcsGuest16::LDTR_SELECTOR.write(0)?;
+            VmcsGuestNW::LDTR_BASE.write(0)?;
+            VmcsGuest32::LDTR_LIMIT.write(0)?;
+            VmcsGuest32::LDTR_ACCESS_RIGHTS.write(SegmentAccessRights::UNUSABLE.bits())?;
+            warn!("VMX LLDT null selector emulated vcpu={}", self.id);
+            return Ok(());
+        }
+
+        let segment = self.guest_segment_from_selector(selector)?;
+        if segment
+            .access_rights
+            .contains(SegmentAccessRights::UNUSABLE)
+        {
+            return ax_err!(InvalidInput, "LLDT selector resolves to unusable segment");
+        }
+        VmcsGuest16::LDTR_SELECTOR.write(selector.bits())?;
+        VmcsGuestNW::LDTR_BASE.write(segment.base as _)?;
+        VmcsGuest32::LDTR_LIMIT.write(segment.limit)?;
+        VmcsGuest32::LDTR_ACCESS_RIGHTS.write(segment.access_rights.bits())?;
+        warn!(
+            "VMX LLDT emulated vcpu={} selector={:#x} base={:#x} limit={:#x} access={:#x}",
+            self.id,
+            selector_raw,
+            segment.base,
+            segment.limit,
+            segment.access_rights.bits()
+        );
         Ok(())
     }
 }
@@ -788,6 +1403,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             self.msr_bitmap.set_write_intercept(msr, true);
         }
 
+        if self.eqgate_nonexit_timer_msr_guard_active() {
+            for msr in [
+                MSR_IA32_TSC_DEADLINE,
+                MSR_IA32_X2APIC_LVT_TIMER,
+                MSR_IA32_X2APIC_INIT_COUNT,
+                MSR_IA32_X2APIC_DIV_CONF,
+            ] {
+                self.msr_bitmap.set_read_intercept(msr, true);
+                self.msr_bitmap.set_write_intercept(msr, true);
+            }
+            info!(
+                "vCPU {} eqgate non-exit timer MSR guard enabled: shadowing tsc_deadline and x2apic timer registers",
+                self.id
+            );
+        }
+
         // Intercept all x2APIC MSR accesses
         // for msr in 0x800..=0x83f {
         //     self.msr_bitmap.set_read_intercept(msr, true);
@@ -823,6 +1454,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             }
             VCpuSetupContext::PVGuestContext(ctx) => {
                 self.vcpu_type = VCPUType::EqParavirtGuest;
+                #[cfg(feature = "microvm-eqgate-idt-exit")]
+                self.xstate.disable_eqgate_idt_unsupported_guest_features();
                 self.setup_vmcs_guest_from_paravirt_ctx(ctx)?;
             }
         }
@@ -922,6 +1555,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         VmcsGuest32::GDTR_LIMIT.write(ctx.gdt.limit as _)?;
         VmcsGuestNW::IDTR_BASE.write(ctx.idt.base.as_u64() as _)?;
         VmcsGuest32::IDTR_LIMIT.write(ctx.idt.limit as _)?;
+        self.eqgate_idt_base = ctx.idt.base.as_u64();
+        self.eqgate_idt_limit = ctx.idt.limit as u32;
 
         VmcsGuestNW::RSP.write(ctx.rsp as _)?;
         VmcsGuestNW::RIP.write(ctx.rip as _)?;
@@ -1129,10 +1764,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.vmx_posted_interrupt_enabled = false;
 
         let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
-        let posted_interrupt_descriptor_supported = self.supports_posted_interrupts();
+        let eqgate_extint_passthrough = self.vcpu_type == VCPUType::EqParavirtGuest
+            && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT;
+        let posted_interrupt_descriptor_supported =
+            self.supports_posted_interrupts() && !eqgate_extint_passthrough;
         let use_vmx_posted_interrupt_delivery = self.vcpu_type == VCPUType::EqParavirtGuest
             && posted_interrupt_descriptor_supported
-            && !cfg!(feature = "microvm-vfio-posted-exit");
+            && !cfg!(feature = "microvm-vfio-posted-exit")
+            && !eqgate_extint_passthrough;
         let mut posted_interrupt_secondary_controls =
             CpuCtrl2::VIRTUALIZE_APIC_REGISTER | CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY;
         if needs_x2apic_virtualization {
@@ -1159,8 +1798,15 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             );
         }
 
+        let mut pinbased_clear_controls = 0;
         let mut pinbased_controls = if self.vcpu_type != VCPUType::Host {
-            (PinCtrl::EXTERNAL_INTERRUPT_EXITING | PinCtrl::NMI_EXITING).bits()
+            let mut controls = PinCtrl::NMI_EXITING.bits();
+            if eqgate_extint_passthrough {
+                pinbased_clear_controls |= PinCtrl::EXTERNAL_INTERRUPT_EXITING.bits();
+            } else {
+                controls |= PinCtrl::EXTERNAL_INTERRUPT_EXITING.bits();
+            }
+            controls
         } else {
             0 // Do not intercept NMI in for host VM now.
         };
@@ -1189,8 +1835,15 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
             pinbased_controls,
-            0,
+            pinbased_clear_controls,
         )?;
+        if eqgate_extint_passthrough {
+            info!(
+                "vCPU {} eqgate non-exit timer external interrupt passthrough experiment enabled: external_interrupt_exiting=false vmx_posted_interrupt_delivery=false posted_descriptor=false timer_msr_guard={}",
+                self.id,
+                ENABLE_EQGATE_NONEXIT_TIMER_MSR_GUARD
+            );
+        }
 
         // Intercept all I/O instructions, use MSR bitmaps, activate secondary controls,
         // disable CR3 load/store interception.
@@ -1219,6 +1872,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             CpuCtrl2::ENABLE_EPT | CpuCtrl2::UNRESTRICTED_GUEST | CpuCtrl2::ENABLE_VM_FUNCTIONS;
         if posted_interrupt_controls_supported {
             val |= posted_interrupt_secondary_controls;
+        }
+        if self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_DESCRIPTOR_TABLE_EXITING {
+            val |= CpuCtrl2::DTABLE_EXITING;
         }
 
         if let Some(features) = raw_cpuid.get_extended_processor_and_feature_identifiers() {
@@ -1651,10 +2307,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                     // Retrieve/validate restrictions on CR4
                     let must0 = Msr::IA32_VMX_CR4_FIXED1.read();
                     let must1 = Msr::IA32_VMX_CR4_FIXED0.read();
-                    let val = val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits();
-                    VmcsGuestNW::CR4.write(((val & must0) | must1) as _)?;
+                    let val =
+                        self.sanitize_eqgate_idt_cr4(val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits());
+                    let guest_cr4 = (val & must0) | must1;
+                    #[cfg(feature = "microvm-eqgate-idt-exit")]
+                    if self.vcpu_type == VCPUType::EqParavirtGuest
+                        && guest_cr4 & CR4_CET_MASK != 0
+                    {
+                        warn!(
+                            "VMX eqgate IDT experiment cannot clear guest CR4.CET: fixed0={:#x} fixed1={:#x} computed={:#x}",
+                            must1, must0, guest_cr4
+                        );
+                    }
+                    VmcsGuestNW::CR4.write(guest_cr4 as _)?;
                     VmcsControlNW::CR4_READ_SHADOW.write(val as _)?;
-                    VmcsControlNW::CR4_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                    let guest_host_mask = self.eqgate_idt_cr4_guest_host_mask(must1 | !must0);
+                    VmcsControlNW::CR4_GUEST_HOST_MASK.write(guest_host_mask as _)?;
                 }
                 _ => unreachable!(),
             };
@@ -1757,10 +2425,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             let pending_before = self.pending_events.lock().len();
             let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
             let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
-            let allow_interrupt = rflags as u64
-                & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits()
-                != 0
-                && block_state == 0;
+            let allow_interrupt =
+                rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
+                    && block_state == 0;
             // debug!(
             //     "inject_pending_events vector {:#x} allow_int {}",
             //     event.0,
@@ -1807,6 +2474,42 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let new_value = (self.regs().rdx << 32) | self.regs().rax;
 
         match ecx {
+            MSR_IA32_TSC_DEADLINE if self.eqgate_nonexit_timer_msr_guard_active() => {
+                if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                    unsafe { wrmsr(ecx, new_value) };
+                    self.trace_eqgate_timer_msr_guard("gate-write", ecx, new_value);
+                } else {
+                    self.eqgate_timer_msr_shadow.tsc_deadline = new_value;
+                    self.trace_eqgate_timer_msr_guard("write", ecx, new_value);
+                }
+            }
+            MSR_IA32_X2APIC_LVT_TIMER if self.eqgate_nonexit_timer_msr_guard_active() => {
+                if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                    unsafe { wrmsr(ecx, new_value) };
+                    self.trace_eqgate_timer_msr_guard("gate-write", ecx, new_value);
+                } else {
+                    self.eqgate_timer_msr_shadow.x2apic_lvt_timer = new_value;
+                    self.trace_eqgate_timer_msr_guard("write", ecx, new_value);
+                }
+            }
+            MSR_IA32_X2APIC_INIT_COUNT if self.eqgate_nonexit_timer_msr_guard_active() => {
+                if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                    unsafe { wrmsr(ecx, new_value) };
+                    self.trace_eqgate_timer_msr_guard("gate-write", ecx, new_value);
+                } else {
+                    self.eqgate_timer_msr_shadow.x2apic_init_count = new_value;
+                    self.trace_eqgate_timer_msr_guard("write", ecx, new_value);
+                }
+            }
+            MSR_IA32_X2APIC_DIV_CONF if self.eqgate_nonexit_timer_msr_guard_active() => {
+                if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                    unsafe { wrmsr(ecx, new_value) };
+                    self.trace_eqgate_timer_msr_guard("gate-write", ecx, new_value);
+                } else {
+                    self.eqgate_timer_msr_shadow.x2apic_div_conf = new_value;
+                    self.trace_eqgate_timer_msr_guard("write", ecx, new_value);
+                }
+            }
             MSR_IA32_TSC_ADJUST => {
                 self.tsc_adjust = new_value;
                 warn!(
@@ -1815,6 +2518,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 );
             }
             MSR_IA32_XSS => {
+                let new_value = self.sanitize_eqgate_idt_xss(new_value);
                 if !self.xstate.is_xss_supported(new_value) {
                     return ax_err!(
                         InvalidInput,
@@ -1863,6 +2567,50 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         let ecx = self.regs().rcx as u32;
 
         match ecx {
+            MSR_IA32_TSC_DEADLINE if self.eqgate_nonexit_timer_msr_guard_active() => {
+                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
+                {
+                    (unsafe { rdmsr(ecx) }, "gate-read")
+                } else {
+                    (self.eqgate_timer_msr_shadow.tsc_deadline, "read")
+                };
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+                self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
+            }
+            MSR_IA32_X2APIC_LVT_TIMER if self.eqgate_nonexit_timer_msr_guard_active() => {
+                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
+                {
+                    (unsafe { rdmsr(ecx) }, "gate-read")
+                } else {
+                    (self.eqgate_timer_msr_shadow.x2apic_lvt_timer, "read")
+                };
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+                self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
+            }
+            MSR_IA32_X2APIC_INIT_COUNT if self.eqgate_nonexit_timer_msr_guard_active() => {
+                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
+                {
+                    (unsafe { rdmsr(ecx) }, "gate-read")
+                } else {
+                    (self.eqgate_timer_msr_shadow.x2apic_init_count, "read")
+                };
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+                self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
+            }
+            MSR_IA32_X2APIC_DIV_CONF if self.eqgate_nonexit_timer_msr_guard_active() => {
+                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
+                {
+                    (unsafe { rdmsr(ecx) }, "gate-read")
+                } else {
+                    (self.eqgate_timer_msr_shadow.x2apic_div_conf, "read")
+                };
+                self.regs_mut().rax = msr_value;
+                self.regs_mut().rdx = msr_value >> 32;
+                self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
+            }
             MSR_AMD64_DE_CFG => {
                 // Just return 0 for `MSR_AMD64_DE_CFG`.
                 let msr_value = 0 as u64;
@@ -1885,7 +2633,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 info!("VMX MSR-Read Exit: MSR_IA32_TSC_ADJUST = {:#x}", msr_value);
             }
             MSR_IA32_XSS => {
-                let msr_value = self.xstate.guest_xss();
+                let msr_value = self.sanitize_eqgate_idt_xss(self.xstate.guest_xss());
                 self.regs_mut().rax = msr_value;
                 self.regs_mut().rdx = msr_value >> 32;
             }
@@ -1915,23 +2663,227 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
+    fn descriptor_table_exit_info(
+        &self,
+        exit_info: &VmxExitInfo,
+    ) -> AxResult<VmxDescriptorTableExitInfo> {
+        Ok(VmxDescriptorTableExitInfo {
+            raw_qualification: exit_qualification()?,
+            guest_rip: exit_info.guest_rip,
+            instruction_len: exit_info.exit_instruction_length,
+        })
+    }
+
+    fn handle_descriptor_table_exit(
+        &mut self,
+        exit_info: &VmxExitInfo,
+    ) -> AxResult<AxVCpuExitReason> {
+        let desc_info = self.descriptor_table_exit_info(exit_info)?;
+        warn!(
+            "VMX descriptor-table exit scaffold vcpu={} rip={:#x} len={} qualification={:#x}",
+            self.id, desc_info.guest_rip, desc_info.instruction_len, desc_info.raw_qualification
+        );
+
+        let instr = self.decode_guest_instruction(
+            GuestVirtAddr::from_usize(desc_info.guest_rip),
+            desc_info.instruction_len as _,
+        )?;
+
+        if let Some(byte_len) = Self::sgdt_descriptor_pointer_len(instr.code()) {
+            let base = VmcsGuestNW::GDTR_BASE.read()? as u64;
+            let limit = VmcsGuest32::GDTR_LIMIT.read()? as u16;
+            let ptr = match self.write_descriptor_pointer(&instr, byte_len, base, limit) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    warn!(
+                        "VMX SGDT desc_ptr scaffold write failed vcpu={} err={:?}",
+                        self.id, err
+                    );
+                    warn!("VCpu {:#x?}", self);
+                    return Ok(AxVCpuExitReason::Halt);
+                }
+            };
+            warn!(
+                "VMX SGDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
+                self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
+            );
+            self.advance_rip(desc_info.instruction_len as _)?;
+            return Ok(self.internal_nothing_exit(VmxInternalExitKind::DescriptorTable));
+        }
+
+        if let Some(byte_len) = Self::sidt_descriptor_pointer_len(instr.code()) {
+            let (base, limit) = if self.shadow_idt_base != 0 {
+                (self.shadow_idt_base, self.shadow_idt_limit)
+            } else {
+                (
+                    VmcsGuestNW::IDTR_BASE.read()? as u64,
+                    VmcsGuest32::IDTR_LIMIT.read()? as u16,
+                )
+            };
+            let ptr = match self.write_descriptor_pointer(&instr, byte_len, base, limit) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    warn!(
+                        "VMX SIDT desc_ptr scaffold write failed vcpu={} err={:?}",
+                        self.id, err
+                    );
+                    warn!("VCpu {:#x?}", self);
+                    return Ok(AxVCpuExitReason::Halt);
+                }
+            };
+            warn!(
+                "VMX SIDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
+                self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
+            );
+            self.advance_rip(desc_info.instruction_len as _)?;
+            return Ok(self.internal_nothing_exit(VmxInternalExitKind::DescriptorTable));
+        }
+
+        if let Some(byte_len) = Self::lgdt_descriptor_pointer_len(instr.code()) {
+            let ptr = match self.read_descriptor_pointer(&instr, byte_len) {
+                Ok(ptr) => ptr,
+                Err(err) => {
+                    warn!(
+                        "VMX LGDT desc_ptr scaffold decode failed vcpu={} err={:?}",
+                        self.id, err
+                    );
+                    warn!("VCpu {:#x?}", self);
+                    return Ok(AxVCpuExitReason::Halt);
+                }
+            };
+            VmcsGuestNW::GDTR_BASE.write(ptr.base as _)?;
+            VmcsGuest32::GDTR_LIMIT.write(ptr.limit as _)?;
+            warn!(
+                "VMX LGDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
+                self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
+            );
+            self.advance_rip(desc_info.instruction_len as _)?;
+            return Ok(self.internal_nothing_exit(VmxInternalExitKind::DescriptorTable));
+        }
+
+        let Some(byte_len) = Self::lidt_descriptor_pointer_len(instr.code()) else {
+            self.decode_instruction(
+                GuestVirtAddr::from_usize(desc_info.guest_rip),
+                desc_info.instruction_len as _,
+            )?;
+            warn!("VCpu {:#x?}", self);
+            return Ok(AxVCpuExitReason::Halt);
+        };
+
+        let ptr = match self.read_descriptor_pointer(&instr, byte_len) {
+            Ok(ptr) => ptr,
+            Err(err) => {
+                warn!(
+                    "VMX LIDT desc_ptr scaffold decode failed vcpu={} err={:?}",
+                    self.id, err
+                );
+                warn!("VCpu {:#x?}", self);
+                return Ok(AxVCpuExitReason::Halt);
+            }
+        };
+        warn!(
+            "VMX LIDT desc_ptr scaffold vcpu={} operand_gva={:#x} base={:#x} limit={:#x} byte_len={}",
+            self.id, ptr.operand_gva, ptr.base, ptr.limit, ptr.byte_len
+        );
+        if let Err(err) = self.handle_lidt_descriptor_pointer(ptr) {
+            warn!("VMX LIDT emulation failed vcpu={} err={:?}", self.id, err);
+            warn!("VCpu {:#x?}", self);
+            return Ok(AxVCpuExitReason::Halt);
+        }
+
+        self.advance_rip(desc_info.instruction_len as _)?;
+        Ok(self.internal_nothing_exit(VmxInternalExitKind::DescriptorTable))
+    }
+
+    fn handle_ldtr_tr_exit(&mut self, exit_info: &VmxExitInfo) -> AxResult<AxVCpuExitReason> {
+        let desc_info = self.descriptor_table_exit_info(exit_info)?;
+        warn!(
+            "VMX LDTR/TR exit scaffold vcpu={} rip={:#x} len={} qualification={:#x}",
+            self.id, desc_info.guest_rip, desc_info.instruction_len, desc_info.raw_qualification
+        );
+
+        let instr = self.decode_guest_instruction(
+            GuestVirtAddr::from_usize(desc_info.guest_rip),
+            desc_info.instruction_len as _,
+        )?;
+        let selector = match self.selector_operand_value(&instr) {
+            Ok(selector) => selector,
+            Err(err) => {
+                warn!(
+                    "VMX LDTR/TR selector decode failed vcpu={} err={:?}",
+                    self.id, err
+                );
+                self.decode_instruction(
+                    GuestVirtAddr::from_usize(desc_info.guest_rip),
+                    desc_info.instruction_len as _,
+                )?;
+                warn!("VCpu {:#x?}", self);
+                return Ok(AxVCpuExitReason::Halt);
+            }
+        };
+
+        let result = match instr.code() {
+            iced_x86::Code::Ltr_rm16 | iced_x86::Code::Ltr_r32m16 | iced_x86::Code::Ltr_r64m16 => {
+                self.emulate_ltr(selector)
+            }
+            iced_x86::Code::Lldt_rm16
+            | iced_x86::Code::Lldt_r32m16
+            | iced_x86::Code::Lldt_r64m16 => self.emulate_lldt(selector),
+            _ => ax_err!(Unsupported, "unsupported LDTR/TR instruction"),
+        };
+
+        if let Err(err) = result {
+            warn!(
+                "VMX LDTR/TR emulation failed vcpu={} err={:?}",
+                self.id, err
+            );
+            self.decode_instruction(
+                GuestVirtAddr::from_usize(desc_info.guest_rip),
+                desc_info.instruction_len as _,
+            )?;
+            warn!("VCpu {:#x?}", self);
+            return Ok(AxVCpuExitReason::Halt);
+        }
+
+        self.advance_rip(desc_info.instruction_len as _)?;
+        Ok(self.internal_nothing_exit(VmxInternalExitKind::LdtrTr))
+    }
+
     /// Handle vm-exits than can and should be handled by [`VmxVcpu`] itself.
     ///
     /// Return the result or None if the vm-exit was not handled.
-    fn builtin_vmexit_handler(&mut self, exit_info: &VmxExitInfo) -> Option<AxResult> {
+    fn builtin_vmexit_handler(
+        &mut self,
+        exit_info: &VmxExitInfo,
+    ) -> Option<(VmxInternalExitKind, AxResult)> {
         // Following vm-exits are handled here:
         // - interrupt window: turn off interrupt window;
         // - xsetbv: set guest xcr;
         // - cr access: just panic;
         match exit_info.exit_reason {
-            VmxExitReason::INTERRUPT_WINDOW => Some(self.set_interrupt_window(false)),
-            VmxExitReason::PREEMPTION_TIMER => Some(self.handle_vmx_preemption_timer()),
-            VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
-            VmxExitReason::CR_ACCESS => Some(self.handle_cr()),
-            VmxExitReason::CPUID => Some(self.handle_cpuid()),
-            VmxExitReason::EXCEPTION_NMI => Some(self.handle_exception_nmi(exit_info)),
-            VmxExitReason::MSR_READ => Some(self.handle_msr_read(exit_info)),
-            VmxExitReason::MSR_WRITE => Some(self.handle_msr_write(exit_info)),
+            VmxExitReason::INTERRUPT_WINDOW => Some((
+                VmxInternalExitKind::InterruptWindow,
+                self.set_interrupt_window(false),
+            )),
+            VmxExitReason::PREEMPTION_TIMER => Some((
+                VmxInternalExitKind::PreemptionTimer,
+                self.handle_vmx_preemption_timer(),
+            )),
+            VmxExitReason::XSETBV => Some((VmxInternalExitKind::Xsetbv, self.handle_xsetbv())),
+            VmxExitReason::CR_ACCESS => Some((VmxInternalExitKind::CrAccess, self.handle_cr())),
+            VmxExitReason::CPUID => Some((VmxInternalExitKind::Cpuid, self.handle_cpuid())),
+            VmxExitReason::EXCEPTION_NMI => Some((
+                VmxInternalExitKind::ExceptionNmi,
+                self.handle_exception_nmi(exit_info),
+            )),
+            VmxExitReason::MSR_READ => Some((
+                VmxInternalExitKind::MsrRead,
+                self.handle_msr_read(exit_info),
+            )),
+            VmxExitReason::MSR_WRITE => Some((
+                VmxInternalExitKind::MsrWrite,
+                self.handle_msr_write(exit_info),
+            )),
             _ => None,
         }
     }
@@ -2024,6 +2976,72 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         );
     }
 
+    fn sanitize_eqgate_idt_cr4(&self, val: u64) -> u64 {
+        #[cfg(feature = "microvm-eqgate-idt-exit")]
+        if self.vcpu_type == VCPUType::EqParavirtGuest && val & CR4_CET_MASK != 0 {
+            warn!(
+                "VMX eqgate IDT experiment masks guest CR4.CET: requested={:#x}",
+                val
+            );
+            return val & !CR4_CET_MASK;
+        }
+        val
+    }
+
+    fn eqgate_idt_cr4_guest_host_mask(&self, mask: u64) -> u64 {
+        #[cfg(feature = "microvm-eqgate-idt-exit")]
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            return mask | CR4_CET_MASK;
+        }
+        mask
+    }
+
+    fn sanitize_eqgate_idt_xss(&self, value: u64) -> u64 {
+        #[cfg(feature = "microvm-eqgate-idt-exit")]
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            return value & !(XFEATURE_EQGATE_IDT_UNSUPPORTED as u64);
+        }
+        value
+    }
+
+    fn sanitize_eqgate_idt_xcr0(&self, index: u64, value: u64) -> u64 {
+        const XCR_XCR0: u64 = 0;
+
+        #[cfg(feature = "microvm-eqgate-idt-exit")]
+        if self.vcpu_type == VCPUType::EqParavirtGuest && index == XCR_XCR0 {
+            return value & !(XFEATURE_EQGATE_IDT_UNSUPPORTED as u64);
+        }
+        value
+    }
+
+    #[cfg(feature = "microvm-eqgate-idt-exit")]
+    fn mask_eqgate_idt_cpuid(
+        leaf: u32,
+        subleaf: u32,
+        mut res: raw_cpuid::CpuIdResult,
+    ) -> raw_cpuid::CpuIdResult {
+        match leaf {
+            0x7 if subleaf == 0 => {
+                res.ecx &= !CPUID_7_0_ECX_CET_SHSTK;
+                res.edx &= !CPUID_7_0_EDX_CET_IBT;
+            }
+            0xd if subleaf == 0 => {
+                res.eax &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+            }
+            0xd if subleaf == 1 => {
+                res.ecx &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+            }
+            0xd if subleaf == 11 || subleaf == 12 => {
+                res.eax = 0;
+                res.ebx = 0;
+                res.ecx = 0;
+                res.edx = 0;
+            }
+            _ => {}
+        }
+        res
+    }
+
     fn handle_cpuid(&mut self) -> AxResult {
         use raw_cpuid::{CpuIdResult, cpuid};
 
@@ -2074,7 +3092,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ecx: vendor_regs[1],
                 edx: vendor_regs[2],
             },
-            LEAF_HYPERVISOR_FEATURE => self.equation_hypervisor_feature_cpuid(regs_clone.rcx as u32),
+            LEAF_HYPERVISOR_FEATURE => {
+                self.equation_hypervisor_feature_cpuid(regs_clone.rcx as u32)
+            }
             EAX_FREQUENCY_INFO => {
                 /// Timer interrupt frequencyin Hz.
                 /// Todo: this should be the same as `axconfig::TIMER_FREQUENCY` defined in ArceOS's config file.
@@ -2090,6 +3110,14 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 res
             }
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
+        };
+        #[cfg(feature = "microvm-eqgate-idt-exit")]
+        let res = {
+            if self.vcpu_type == VCPUType::EqParavirtGuest {
+                Self::mask_eqgate_idt_cpuid(function, regs_clone.rcx as u32, res)
+            } else {
+                res
+            }
         };
 
         // trace!(
@@ -2138,13 +3166,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             },
             subleaf if subleaf >= 0x80 => {
                 let index = (subleaf - 0x80) as usize;
-                let gate_rsp_slot_va =
-                    if index < abi.vcpu_count as usize && index < abi.vcpu_gate_rsp_slot_vas.len()
-                    {
-                        abi.vcpu_gate_rsp_slot_vas[index]
-                    } else {
-                        0
-                    };
+                let gate_rsp_slot_va = if index < abi.vcpu_count as usize
+                    && index < abi.vcpu_gate_rsp_slot_vas.len()
+                {
+                    abi.vcpu_gate_rsp_slot_vas[index]
+                } else {
+                    0
+                };
                 CpuIdResult {
                     eax: gate_rsp_slot_va as u32,
                     ebx: (gate_rsp_slot_va >> 32) as u32,
@@ -2180,6 +3208,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         let index = self.guest_regs.rcx.get_bits(0..32);
         let value = self.guest_regs.rdx.get_bits(0..32) << 32 | self.guest_regs.rax.get_bits(0..32);
+        let value = self.sanitize_eqgate_idt_xcr0(index, value);
 
         if index == XCR_XCR0 {
             if !XState::validate_xcr0(value) {
@@ -2550,6 +3579,8 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                             index: self.guest_regs.rcx as usize,
                         }
                     }
+                    VmxExitReason::GDTR_IDTR => self.handle_descriptor_table_exit(&exit_info)?,
+                    VmxExitReason::LDTR_TR => self.handle_ldtr_tr_exit(&exit_info)?,
                     _ => {
                         warn!("VMX unsupported VM-Exit: {:#x?}", exit_info);
 

@@ -62,8 +62,8 @@ impl<H: AxVCpuHal> PostedInterruptDescriptor<H> {
     const NOTIFICATION_VECTOR_SHIFT: u64 = 16;
     const NOTIFICATION_VECTOR_MASK: u64 = 0xff << Self::NOTIFICATION_VECTOR_SHIFT;
     const NOTIFICATION_DESTINATION_SHIFT: u64 = 32;
-    const NOTIFICATION_DESTINATION_MASK: u64 = 0xffff_ffffu64
-        << Self::NOTIFICATION_DESTINATION_SHIFT;
+    const NOTIFICATION_DESTINATION_MASK: u64 =
+        0xffff_ffffu64 << Self::NOTIFICATION_DESTINATION_SHIFT;
 
     pub fn new(notification_vector: u8) -> AxResult<Self> {
         let frame = PhysFrame::alloc_zero()?;

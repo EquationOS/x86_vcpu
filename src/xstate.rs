@@ -22,6 +22,13 @@ pub const XFEATURE_AVX512: u64 = XFEATURE_OPMASK | XFEATURE_ZMM_HI256 | XFEATURE
 pub const XFEATURE_MPX: u64 = XFEATURE_BNDREGS | XFEATURE_BNDCSR;
 pub const XFEATURE_REQUIRED: u64 = XFEATURE_FP;
 
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_CET_USER: u64 = 1 << 11;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_CET_KERNEL: u64 = 1 << 12;
+#[cfg(feature = "microvm-eqgate-idt-exit")]
+const XFEATURE_EQGATE_IDT_UNSUPPORTED: u64 = XFEATURE_CET_USER | XFEATURE_CET_KERNEL;
+
 const XSAVE_AREA_ALIGN: usize = 64;
 const XSAVE_LEGACY_AREA_SIZE: usize = 512;
 const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_AREA_SIZE;
@@ -187,8 +194,7 @@ impl XState {
         let standard = raw_cpuid_count(0x0d, 0);
         let compacted = raw_cpuid_count(0x0d, 1);
         let (supported_xcr0, supported_xss) = Self::supported_xfeatures();
-        let supported_compacted =
-            Self::compacted_xsave_area_size(supported_xcr0 | supported_xss);
+        let supported_compacted = Self::compacted_xsave_area_size(supported_xcr0 | supported_xss);
         (standard.ecx as usize)
             .max(standard.ebx as usize)
             .max(compacted.ebx as usize)
@@ -228,6 +234,15 @@ impl XState {
 
     pub fn is_xfd_supported(&self, xfd: u64) -> bool {
         (xfd & !self.supported_xfd) == 0
+    }
+
+    #[cfg(feature = "microvm-eqgate-idt-exit")]
+    pub fn disable_eqgate_idt_unsupported_guest_features(&mut self) {
+        self.supported_xcr0 &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+        self.supported_xss &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+        self.guest_xcr0 &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+        self.guest_xss &= !XFEATURE_EQGATE_IDT_UNSUPPORTED;
+        self.prepare_guest_xsave();
     }
 
     pub fn validate_xcr0(xcr0: u64) -> bool {
