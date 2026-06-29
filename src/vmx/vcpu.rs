@@ -981,30 +981,134 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
     }
 
+    fn iced_gpr_index(reg: iced_x86::Register) -> Option<u8> {
+        use iced_x86::Register;
+
+        match reg {
+            Register::RAX | Register::EAX | Register::AX | Register::AL | Register::AH => Some(0),
+            Register::RCX | Register::ECX | Register::CX | Register::CL | Register::CH => Some(1),
+            Register::RDX | Register::EDX | Register::DX | Register::DL | Register::DH => Some(2),
+            Register::RBX | Register::EBX | Register::BX | Register::BL | Register::BH => Some(3),
+            Register::RBP | Register::EBP | Register::BP | Register::BPL => Some(5),
+            Register::RSI | Register::ESI | Register::SI | Register::SIL => Some(6),
+            Register::RDI | Register::EDI | Register::DI | Register::DIL => Some(7),
+            Register::R8 | Register::R8D | Register::R8W | Register::R8L => Some(8),
+            Register::R9 | Register::R9D | Register::R9W | Register::R9L => Some(9),
+            Register::R10 | Register::R10D | Register::R10W | Register::R10L => Some(10),
+            Register::R11 | Register::R11D | Register::R11W | Register::R11L => Some(11),
+            Register::R12 | Register::R12D | Register::R12W | Register::R12L => Some(12),
+            Register::R13 | Register::R13D | Register::R13W | Register::R13L => Some(13),
+            Register::R14 | Register::R14D | Register::R14W | Register::R14L => Some(14),
+            Register::R15 | Register::R15D | Register::R15W | Register::R15L => Some(15),
+            _ => None,
+        }
+    }
+
+    fn iced_register_width(reg: iced_x86::Register) -> Option<AccessWidth> {
+        use iced_x86::Register;
+
+        match reg {
+            Register::RAX
+            | Register::RCX
+            | Register::RDX
+            | Register::RBX
+            | Register::RSP
+            | Register::RBP
+            | Register::RSI
+            | Register::RDI
+            | Register::R8
+            | Register::R9
+            | Register::R10
+            | Register::R11
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15 => Some(AccessWidth::Qword),
+            Register::EAX
+            | Register::ECX
+            | Register::EDX
+            | Register::EBX
+            | Register::ESP
+            | Register::EBP
+            | Register::ESI
+            | Register::EDI
+            | Register::R8D
+            | Register::R9D
+            | Register::R10D
+            | Register::R11D
+            | Register::R12D
+            | Register::R13D
+            | Register::R14D
+            | Register::R15D => Some(AccessWidth::Dword),
+            Register::AX
+            | Register::CX
+            | Register::DX
+            | Register::BX
+            | Register::SP
+            | Register::BP
+            | Register::SI
+            | Register::DI
+            | Register::R8W
+            | Register::R9W
+            | Register::R10W
+            | Register::R11W
+            | Register::R12W
+            | Register::R13W
+            | Register::R14W
+            | Register::R15W => Some(AccessWidth::Word),
+            Register::AL
+            | Register::CL
+            | Register::DL
+            | Register::BL
+            | Register::AH
+            | Register::CH
+            | Register::DH
+            | Register::BH
+            | Register::SPL
+            | Register::BPL
+            | Register::SIL
+            | Register::DIL
+            | Register::R8L
+            | Register::R9L
+            | Register::R10L
+            | Register::R11L
+            | Register::R12L
+            | Register::R13L
+            | Register::R14L
+            | Register::R15L => Some(AccessWidth::Byte),
+            _ => None,
+        }
+    }
+
     fn iced_register_value(&self, reg: iced_x86::Register) -> Option<u64> {
         use iced_x86::Register;
 
         let regs = self.regs();
         match reg {
             Register::None => Some(0),
-            Register::RAX | Register::EAX | Register::AX => Some(regs.rax),
-            Register::RCX | Register::ECX | Register::CX => Some(regs.rcx),
-            Register::RDX | Register::EDX | Register::DX => Some(regs.rdx),
-            Register::RBX | Register::EBX | Register::BX => Some(regs.rbx),
+            Register::RAX | Register::EAX | Register::AX | Register::AL => Some(regs.rax),
+            Register::AH => Some(regs.rax >> 8),
+            Register::RCX | Register::ECX | Register::CX | Register::CL => Some(regs.rcx),
+            Register::CH => Some(regs.rcx >> 8),
+            Register::RDX | Register::EDX | Register::DX | Register::DL => Some(regs.rdx),
+            Register::DH => Some(regs.rdx >> 8),
+            Register::RBX | Register::EBX | Register::BX | Register::BL => Some(regs.rbx),
+            Register::BH => Some(regs.rbx >> 8),
             Register::RSP | Register::ESP | Register::SP => {
                 VmcsGuestNW::RSP.read().ok().map(|v| v as u64)
             }
-            Register::RBP | Register::EBP | Register::BP => Some(regs.rbp),
-            Register::RSI | Register::ESI | Register::SI => Some(regs.rsi),
-            Register::RDI | Register::EDI | Register::DI => Some(regs.rdi),
-            Register::R8 | Register::R8D | Register::R8W => Some(regs.r8),
-            Register::R9 | Register::R9D | Register::R9W => Some(regs.r9),
-            Register::R10 | Register::R10D | Register::R10W => Some(regs.r10),
-            Register::R11 | Register::R11D | Register::R11W => Some(regs.r11),
-            Register::R12 | Register::R12D | Register::R12W => Some(regs.r12),
-            Register::R13 | Register::R13D | Register::R13W => Some(regs.r13),
-            Register::R14 | Register::R14D | Register::R14W => Some(regs.r14),
-            Register::R15 | Register::R15D | Register::R15W => Some(regs.r15),
+            Register::SPL => VmcsGuestNW::RSP.read().ok().map(|v| (v as u64) & 0xff),
+            Register::RBP | Register::EBP | Register::BP | Register::BPL => Some(regs.rbp),
+            Register::RSI | Register::ESI | Register::SI | Register::SIL => Some(regs.rsi),
+            Register::RDI | Register::EDI | Register::DI | Register::DIL => Some(regs.rdi),
+            Register::R8 | Register::R8D | Register::R8W | Register::R8L => Some(regs.r8),
+            Register::R9 | Register::R9D | Register::R9W | Register::R9L => Some(regs.r9),
+            Register::R10 | Register::R10D | Register::R10W | Register::R10L => Some(regs.r10),
+            Register::R11 | Register::R11D | Register::R11W | Register::R11L => Some(regs.r11),
+            Register::R12 | Register::R12D | Register::R12W | Register::R12L => Some(regs.r12),
+            Register::R13 | Register::R13D | Register::R13W | Register::R13L => Some(regs.r13),
+            Register::R14 | Register::R14D | Register::R14W | Register::R14L => Some(regs.r14),
+            Register::R15 | Register::R15D | Register::R15W | Register::R15L => Some(regs.r15),
             Register::RIP | Register::EIP => VmcsGuestNW::RIP.read().ok().map(|v| v as u64),
             Register::ES
             | Register::CS
@@ -1014,6 +1118,94 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             | Register::GS => self.guest_segment_base(reg),
             _ => None,
         }
+    }
+
+    fn mmio_memory_width(instr: &iced_x86::Instruction) -> Option<AccessWidth> {
+        AccessWidth::try_from(instr.memory_size().info().size()).ok()
+    }
+
+    fn mmio_write_value(
+        &self,
+        instr: &iced_x86::Instruction,
+        operand: u32,
+        width: AccessWidth,
+    ) -> Option<u64> {
+        match instr.op_kind(operand) {
+            iced_x86::OpKind::Register => {
+                let mask = match width {
+                    AccessWidth::Byte => 0xff,
+                    AccessWidth::Word => 0xffff,
+                    AccessWidth::Dword => 0xffff_ffff,
+                    AccessWidth::Qword => u64::MAX,
+                };
+                self.iced_register_value(instr.op_register(operand))
+                    .map(|value| value & mask)
+            }
+            iced_x86::OpKind::Immediate8
+            | iced_x86::OpKind::Immediate16
+            | iced_x86::OpKind::Immediate32
+            | iced_x86::OpKind::Immediate32to64
+            | iced_x86::OpKind::Immediate64 => instr.try_immediate(operand).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn decode_mmio_from_ept_violation(
+        &mut self,
+        fault_gpa: GuestPhysAddr,
+        access_flags: MappingFlags,
+    ) -> AxResult<Option<AxVCpuExitReason>> {
+        let exit_info = self.exit_info()?;
+        if exit_info.exit_instruction_length == 0 {
+            return Ok(None);
+        }
+
+        let instr = self.decode_guest_instruction(
+            GuestVirtAddr::from_usize(exit_info.guest_rip),
+            exit_info.exit_instruction_length as _,
+        )?;
+        let Some(width) = Self::mmio_memory_width(&instr) else {
+            return Ok(None);
+        };
+
+        if access_flags.contains(MappingFlags::WRITE) {
+            if instr.op0_kind() != iced_x86::OpKind::Memory || instr.op_count() < 2 {
+                return Ok(None);
+            }
+            let Some(data) = self.mmio_write_value(&instr, 1, width) else {
+                return Ok(None);
+            };
+            self.advance_rip(exit_info.exit_instruction_length as _)?;
+            return Ok(Some(AxVCpuExitReason::MmioWrite {
+                addr: fault_gpa,
+                width,
+                data,
+            }));
+        }
+
+        if access_flags.contains(MappingFlags::READ) {
+            if instr.op0_kind() != iced_x86::OpKind::Register
+                || instr.op1_kind() != iced_x86::OpKind::Memory
+            {
+                return Ok(None);
+            }
+            let reg = instr.op0_register();
+            let Some(reg_index) = Self::iced_gpr_index(reg) else {
+                return Ok(None);
+            };
+            let Some(reg_width) = Self::iced_register_width(reg) else {
+                return Ok(None);
+            };
+            self.advance_rip(exit_info.exit_instruction_length as _)?;
+            return Ok(Some(AxVCpuExitReason::MmioRead {
+                addr: fault_gpa,
+                width,
+                reg: reg_index as usize,
+                reg_width,
+            }));
+        }
+
+        Ok(None)
     }
 
     fn lidt_descriptor_pointer_len(code: iced_x86::Code) -> Option<usize> {
