@@ -33,9 +33,11 @@ cfg_if::cfg_if! {
         pub use vmx::PendingEvent;
         pub use vmx::{
             EQUATION_PV_FEATURE_APIC_ID, EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_IPI,
-            EQUATION_PV_FEATURE_CPU_RESIZE, EQUATION_PV_FEATURE_SHADOW_IDT,
+            EQUATION_PV_FEATURE_CPU_RESIZE, EQUATION_PV_FEATURE_HYPERALLOC,
+            EQUATION_PV_FEATURE_SHADOW_IDT,
             EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER, EquationPvAbi,
         };
+        pub use vmx::EqGateResumeContext;
         pub use vmx::VmxInternalExitKind;
 
         pub use vender::VmxArchVCpu;

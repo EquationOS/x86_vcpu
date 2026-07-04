@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::{arch::naked_asm, mem::size_of};
 use memory_addr::MemoryAddr;
 
@@ -51,6 +51,23 @@ use crate::{msr::Msr, regs::GeneralRegisters};
 
 pub type PendingEvent = (u8, Option<u32>);
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EqGateResumeContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub efer: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
 #[cfg(feature = "microvm-eqgate-long-preemption-timer")]
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 32_000;
 #[cfg(not(feature = "microvm-eqgate-long-preemption-timer"))]
@@ -85,11 +102,15 @@ const APIC_MAX_LVT_INDEX: u32 = 6;
 const POSTED_INTERRUPT_SYNC_TRACE_LIMIT: usize = 128;
 const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
 const VM_ENTRY_INJECTION_TRACE_LIMIT: usize = 512;
+const VM_ENTRY_INJECTION_PROGRESS_SAMPLE_MASK: u64 = 0xff;
+const VM_ENTRY_NON_TIMER_PROGRESS_SAMPLE_MASK: u64 = 0x3f;
+const VM_ENTRY_EQUATION_TIMER_VECTOR: u8 = 0xf5;
 const ENABLE_DESCRIPTOR_TABLE_EXITING: bool = cfg!(feature = "microvm-eqgate-idt-exit");
 const ENABLE_EQGATE_NONEXIT_TIMER_EXTINT: bool =
     cfg!(feature = "microvm-eqgate-nonexit-timer-extint");
 const ENABLE_EQGATE_NONEXIT_TIMER_MSR_GUARD: bool =
     cfg!(feature = "microvm-eqgate-nonexit-timer-msr-guard");
+const ENABLE_MICROVM_VFIO_NO_APICV: bool = cfg!(feature = "microvm-vfio-no-apicv");
 const EQGATE_TIMER_MSR_GUARD_TRACE_LIMIT: usize = 64;
 const EQGATE_KERNEL_BASE_VADDR: u64 = 0xffff_8001_0000_0000;
 const EQGATE_KERNEL_END_VADDR: u64 = 0xffff_8002_0000_0000;
@@ -114,7 +135,128 @@ const XFEATURE_EQGATE_IDT_UNSUPPORTED: u32 = XFEATURE_CET_USER | XFEATURE_CET_KE
 static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VM_ENTRY_PENDING_ATTEMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_INJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_NON_TIMER_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_APIC_IRR_VECTOR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_APIC_ISR_VECTOR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static VM_ENTRY_PENDING_MAX_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static EQGATE_TIMER_MSR_GUARD_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug)]
+struct VmEntryApicSnapshot {
+    rvi: u8,
+    svi: u8,
+    tpr: u32,
+    ppr: u32,
+    irr_word: u32,
+    isr_word: u32,
+    irr_bit: bool,
+    isr_bit: bool,
+}
+
+fn update_vm_entry_pending_max_depth(depth: usize) {
+    let mut observed = VM_ENTRY_PENDING_MAX_DEPTH.load(Ordering::Relaxed);
+    while depth > observed {
+        match VM_ENTRY_PENDING_MAX_DEPTH.compare_exchange(
+            observed,
+            depth,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => observed = current,
+        }
+    }
+}
+
+fn maybe_log_vm_entry_injection_progress(
+    vcpu_id: usize,
+    reason: &'static str,
+    vector: u8,
+    pending_before: usize,
+    pending_after: usize,
+    rflags: usize,
+    block_state: u32,
+    total: u64,
+    apic: Option<VmEntryApicSnapshot>,
+) {
+    let blocked_total = VM_ENTRY_PENDING_BLOCKED_TOTAL.load(Ordering::Relaxed);
+    let non_timer_total = if vector == VM_ENTRY_EQUATION_TIMER_VECTOR {
+        VM_ENTRY_PENDING_NON_TIMER_TOTAL.load(Ordering::Relaxed)
+    } else {
+        VM_ENTRY_PENDING_NON_TIMER_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+    };
+    let apic_irr_total = if apic.map(|snapshot| snapshot.irr_bit).unwrap_or(false) {
+        VM_ENTRY_PENDING_APIC_IRR_VECTOR_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        VM_ENTRY_PENDING_APIC_IRR_VECTOR_TOTAL.load(Ordering::Relaxed)
+    };
+    let apic_isr_total = if apic.map(|snapshot| snapshot.isr_bit).unwrap_or(false) {
+        VM_ENTRY_PENDING_APIC_ISR_VECTOR_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        VM_ENTRY_PENDING_APIC_ISR_VECTOR_TOTAL.load(Ordering::Relaxed)
+    };
+    let apic_bit_seen = apic
+        .map(|snapshot| snapshot.irr_bit || snapshot.isr_bit)
+        .unwrap_or(false);
+    let should_log = total <= 16
+        || (total & VM_ENTRY_INJECTION_PROGRESS_SAMPLE_MASK) == 0
+        || (vector != VM_ENTRY_EQUATION_TIMER_VECTOR
+            && (non_timer_total <= 64
+                || (non_timer_total & VM_ENTRY_NON_TIMER_PROGRESS_SAMPLE_MASK) == 0))
+        || (reason == "blocked"
+            && (blocked_total <= 16
+                || (blocked_total & VM_ENTRY_INJECTION_PROGRESS_SAMPLE_MASK) == 0))
+        || (apic_bit_seen && (apic_isr_total <= 16 || (apic_isr_total & 0x3f) == 0));
+    if !should_log {
+        return;
+    }
+
+    let (apic_valid, rvi, svi, tpr, ppr, irr_word, isr_word, irr_bit, isr_bit) =
+        if let Some(snapshot) = apic {
+            (
+                true,
+                snapshot.rvi,
+                snapshot.svi,
+                snapshot.tpr,
+                snapshot.ppr,
+                snapshot.irr_word,
+                snapshot.isr_word,
+                snapshot.irr_bit,
+                snapshot.isr_bit,
+            )
+        } else {
+            (false, 0, 0, 0, 0, 0, 0, false, false)
+        };
+    warn!(
+        "vCPU VM-entry injection progress vcpu={} reason={} vector={:#x} pending_before={} pending_after={} pending_max={} attempts={} injected={} blocked={} non_timer={} rflags={:#x} block_state={:#x} apic_valid={} rvi={:#x} svi={:#x} tpr={:#x} ppr={:#x} irr_word={:#x} isr_word={:#x} irr_bit={} isr_bit={} apic_irr_seen={} apic_isr_seen={}",
+        vcpu_id,
+        reason,
+        vector,
+        pending_before,
+        pending_after,
+        VM_ENTRY_PENDING_MAX_DEPTH.load(Ordering::Relaxed),
+        total,
+        VM_ENTRY_PENDING_INJECTED_TOTAL.load(Ordering::Relaxed),
+        blocked_total,
+        non_timer_total,
+        rflags,
+        block_state,
+        apic_valid,
+        rvi,
+        svi,
+        tpr,
+        ppr,
+        irr_word,
+        isr_word,
+        irr_bit,
+        isr_bit,
+        apic_irr_total,
+        apic_isr_total
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 struct VmxDescriptorTableExitInfo {
@@ -138,6 +280,7 @@ pub const EQUATION_PV_FEATURE_APIC_ID: u32 = 1 << 3;
 pub const EQUATION_PV_FEATURE_IPI: u32 = 1 << 4;
 pub const EQUATION_PV_FEATURE_CPU_RESIZE: u32 = 1 << 5;
 pub const EQUATION_PV_FEATURE_SHADOW_IDT: u32 = 1 << 6;
+pub const EQUATION_PV_FEATURE_HYPERALLOC: u32 = 1 << 7;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -337,6 +480,53 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         unsafe {
             vmx::vmclear(self.vmcs.phys_addr().as_usize() as u64).map_err(as_axerr)?;
         }
+        Ok(())
+    }
+
+    /// Restore the currently loaded VMCS to an EqGate paravirt context in place.
+    ///
+    /// This is intentionally narrower than `setup_from_context`: the microVM
+    /// runner calls it after a VM exit while the VMCS is still loaded on the
+    /// current pCPU. It must not clear/unbind the VMCS or reset the launch state,
+    /// otherwise the runner cannot continue with the next `vmresume`.
+    pub fn reset_loaded_paravirt_context(
+        &mut self,
+        ept_root: HostPhysAddr,
+        ctx: GuestContext,
+    ) -> AxResult {
+        self.vcpu_type = VCPUType::EqParavirtGuest;
+        self.guest_regs
+            .load_from_context(&VCpuSetupContext::PVGuestContext(ctx.clone()));
+        self.setup_vmcs_guest_from_paravirt_ctx(ctx)?;
+        self.set_ept_pointer(EPTPointer::from_table_phys(ept_root))?;
+        Ok(())
+    }
+
+    /// Restore the currently loaded VMCS to an already-initialized EqGate
+    /// scheduling context.
+    pub fn reset_loaded_eqgate_context(
+        &mut self,
+        ept_root: HostPhysAddr,
+        mut base_ctx: GuestContext,
+        resume_ctx: EqGateResumeContext,
+    ) -> AxResult {
+        self.vcpu_type = VCPUType::EqParavirtGuest;
+        base_ctx.rip = resume_ctx.rip;
+        base_ctx.rsp = resume_ctx.rsp;
+        base_ctx.cr3 = resume_ctx.cr3;
+        base_ctx.cr4 = Cr4Flags::from_bits_truncate(resume_ctx.cr4);
+        base_ctx.fs.base = resume_ctx.fs_base;
+        base_ctx.gs.base = resume_ctx.gs_base;
+        base_ctx.efer = EferFlags::from_bits_truncate(resume_ctx.efer);
+
+        self.setup_vmcs_guest_from_paravirt_ctx(base_ctx)?;
+        self.guest_regs.rbx = resume_ctx.rbx;
+        self.guest_regs.rbp = resume_ctx.rbp;
+        self.guest_regs.r12 = resume_ctx.r12;
+        self.guest_regs.r13 = resume_ctx.r13;
+        self.guest_regs.r14 = resume_ctx.r14;
+        self.guest_regs.r15 = resume_ctx.r15;
+        self.set_ept_pointer(EPTPointer::from_table_phys(ept_root))?;
         Ok(())
     }
 
@@ -1953,14 +2143,22 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.vmx_posted_interrupt_enabled = false;
 
         let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
-        let eqgate_extint_passthrough = self.vcpu_type == VCPUType::EqParavirtGuest
-            && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT;
+        let eqgate_extint_passthrough = false;
+        if self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT {
+            warn!(
+                "vCPU {} eqgate non-exit timer external interrupt passthrough disabled: host stop/quiesce requires external_interrupt_exiting=true",
+                self.id
+            );
+        }
+        let vfio_apicv_disabled =
+            self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_MICROVM_VFIO_NO_APICV;
         let posted_interrupt_descriptor_supported =
             self.supports_posted_interrupts() && !eqgate_extint_passthrough;
         let use_vmx_posted_interrupt_delivery = self.vcpu_type == VCPUType::EqParavirtGuest
             && posted_interrupt_descriptor_supported
             && !cfg!(feature = "microvm-vfio-posted-exit")
-            && !eqgate_extint_passthrough;
+            && !eqgate_extint_passthrough
+            && !vfio_apicv_disabled;
         let mut posted_interrupt_secondary_controls =
             CpuCtrl2::VIRTUALIZE_APIC_REGISTER | CpuCtrl2::VIRTUAL_INTERRUPT_DELIVERY;
         if needs_x2apic_virtualization {
@@ -1984,6 +2182,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             warn!(
                 "vCPU {} VMX posted interrupt disabled: required APICv controls unsupported x2apic_required={}",
                 self.id, needs_x2apic_virtualization
+            );
+        }
+        if vfio_apicv_disabled {
+            warn!(
+                "vCPU {} microVM VFIO APICv delivery disabled by feature: vm_entry_injection=true posted_descriptor_supported={}",
+                self.id, posted_interrupt_descriptor_supported
             );
         }
 
@@ -2558,7 +2762,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -2570,7 +2774,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -2578,7 +2782,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -2606,17 +2810,44 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             && block_state == 0
     }
 
+    fn vm_entry_apic_snapshot(&self, vector: u8) -> AxResult<Option<VmEntryApicSnapshot>> {
+        if !self.vmx_posted_interrupt_enabled {
+            return Ok(None);
+        }
+
+        let status = VmcsGuest16::INTERRUPT_STATUS.read()?;
+        let page = self.virtual_apic_page.as_mut_ptr();
+        let word_offset = ((vector as usize) / 32) * 0x10;
+        let bit = 1u32 << (vector as u32 & 31);
+        let irr_word = read_virtual_apic_reg(page, APIC_IRR + word_offset);
+        let isr_word = read_virtual_apic_reg(page, APIC_ISR + word_offset);
+        Ok(Some(VmEntryApicSnapshot {
+            rvi: (status & 0xff) as u8,
+            svi: (status >> 8) as u8,
+            tpr: read_virtual_apic_reg(page, APIC_TASKPRI),
+            ppr: read_virtual_apic_reg(page, APIC_PROCPRI),
+            irr_word,
+            isr_word,
+            irr_bit: (irr_word & bit) != 0,
+            isr_bit: (isr_word & bit) != 0,
+        }))
+    }
+
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> AxResult {
         let event = self.pending_events.lock().front().copied();
         if let Some(event) = event {
             let vector = event.0;
             let pending_before = self.pending_events.lock().len();
+            let attempt_total =
+                VM_ENTRY_PENDING_ATTEMPT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            update_vm_entry_pending_max_depth(pending_before);
             let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
             let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
             let allow_interrupt =
                 rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
                     && block_state == 0;
+            let apic_snapshot = self.vm_entry_apic_snapshot(vector)?;
             // debug!(
             //     "inject_pending_events vector {:#x} allow_int {}",
             //     event.0,
@@ -2631,6 +2862,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                         pending_events.pop_front();
                     }
                 }
+                VM_ENTRY_PENDING_INJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                let pending_after = self.pending_events.lock().len();
+                maybe_log_vm_entry_injection_progress(
+                    self.id,
+                    "injected",
+                    vector,
+                    pending_before,
+                    pending_after,
+                    rflags,
+                    block_state,
+                    attempt_total,
+                    apic_snapshot,
+                );
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     debug!(
@@ -2638,7 +2882,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                         self.id,
                         vector,
                         pending_before,
-                        self.pending_events.lock().len(),
+                        pending_after,
                         rflags,
                         block_state
                     );
@@ -2646,6 +2890,18 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             } else {
                 // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
+                VM_ENTRY_PENDING_BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                maybe_log_vm_entry_injection_progress(
+                    self.id,
+                    "blocked",
+                    vector,
+                    pending_before,
+                    pending_before,
+                    rflags,
+                    block_state,
+                    attempt_total,
+                    apic_snapshot,
+                );
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     debug!(
