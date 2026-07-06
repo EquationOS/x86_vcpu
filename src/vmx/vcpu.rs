@@ -230,7 +230,7 @@ fn maybe_log_vm_entry_injection_progress(
         } else {
             (false, 0, 0, 0, 0, 0, 0, false, false)
         };
-    warn!(
+    trace!(
         "vCPU VM-entry injection progress vcpu={} reason={} vector={:#x} pending_before={} pending_after={} pending_max={} attempts={} injected={} blocked={} non_timer={} rflags={:#x} block_state={:#x} apic_valid={} rvi={:#x} svi={:#x} tpr={:#x} ppr={:#x} irr_word={:#x} isr_word={:#x} irr_bit={} isr_bit={} apic_irr_seen={} apic_isr_seen={}",
         vcpu_id,
         reason,
@@ -1159,6 +1159,30 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Ok(())
     }
 
+    fn log_guest_page_mapping(&self, label: &str, gva: GuestVirtAddr) {
+        match self.guest_page_table_query_raw(gva) {
+            Ok((gpa, flags, page_size, raw)) => warn!(
+                "Guest page mapping label={} gva={:#x} gpa={:#x} flags={:?} page_size={:?} raw={:#x}",
+                label,
+                gva.as_usize(),
+                gpa.as_usize(),
+                flags,
+                page_size,
+                raw
+            ),
+            Err(err) => warn!(
+                "Guest page mapping failed label={} gva={:#x} cr3={:#x} cr4={:#x} efer={:#x} level={} error={:?}",
+                label,
+                gva.as_usize(),
+                VmcsGuestNW::CR3.read().unwrap_or_default(),
+                VmcsGuestNW::CR4.read().unwrap_or_default(),
+                VmcsGuest64::IA32_EFER.read().unwrap_or_default(),
+                self.get_paging_level(),
+                err
+            ),
+        }
+    }
+
     fn guest_segment_base(&self, reg: iced_x86::Register) -> Option<u64> {
         match reg {
             iced_x86::Register::ES => VmcsGuestNW::ES_BASE.read().ok().map(|v| v as u64),
@@ -1932,10 +1956,26 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         VmcsGuestNW::GDTR_BASE.write(ctx.gdt.base.as_u64() as _)?;
         VmcsGuest32::GDTR_LIMIT.write(ctx.gdt.limit as _)?;
-        VmcsGuestNW::IDTR_BASE.write(ctx.idt.base.as_u64() as _)?;
-        VmcsGuest32::IDTR_LIMIT.write(ctx.idt.limit as _)?;
-        self.eqgate_idt_base = ctx.idt.base.as_u64();
-        self.eqgate_idt_limit = ctx.idt.limit as u32;
+        let mut idt_base = ctx.idt.base.as_u64();
+        let mut idt_limit = ctx.idt.limit as u32;
+        if self.vcpu_type == VCPUType::EqParavirtGuest {
+            self.shadow_idt_base = 0;
+            self.shadow_idt_limit = 0;
+            self.shadow_idt_generation = 0;
+            if idt_base == 0 && self.eqgate_idt_base != 0 {
+                idt_base = self.eqgate_idt_base;
+                idt_limit = self.eqgate_idt_limit;
+                info!(
+                    "VCpu[{}] preserving EqGate IDTR base={:#x} limit={:#x} across paravirt context reset",
+                    self.id, idt_base, idt_limit
+                );
+            } else {
+                self.eqgate_idt_base = idt_base;
+                self.eqgate_idt_limit = idt_limit;
+            }
+        }
+        VmcsGuestNW::IDTR_BASE.write(idt_base as _)?;
+        VmcsGuest32::IDTR_LIMIT.write(idt_limit)?;
 
         VmcsGuestNW::RSP.write(ctx.rsp as _)?;
         VmcsGuestNW::RIP.write(ctx.rip as _)?;
@@ -2762,7 +2802,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -2774,7 +2814,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -2782,7 +2822,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -2847,7 +2887,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             let allow_interrupt =
                 rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
                     && block_state == 0;
-            let apic_snapshot = self.vm_entry_apic_snapshot(vector)?;
+            let progress_trace_enabled = log::log_enabled!(log::Level::Trace);
+            let apic_snapshot = if progress_trace_enabled {
+                self.vm_entry_apic_snapshot(vector)?
+            } else {
+                None
+            };
             // debug!(
             //     "inject_pending_events vector {:#x} allow_int {}",
             //     event.0,
@@ -2864,17 +2909,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 }
                 VM_ENTRY_PENDING_INJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 let pending_after = self.pending_events.lock().len();
-                maybe_log_vm_entry_injection_progress(
-                    self.id,
-                    "injected",
-                    vector,
-                    pending_before,
-                    pending_after,
-                    rflags,
-                    block_state,
-                    attempt_total,
-                    apic_snapshot,
-                );
+                if progress_trace_enabled {
+                    maybe_log_vm_entry_injection_progress(
+                        self.id,
+                        "injected",
+                        vector,
+                        pending_before,
+                        pending_after,
+                        rflags,
+                        block_state,
+                        attempt_total,
+                        apic_snapshot,
+                    );
+                }
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     debug!(
@@ -2891,17 +2938,19 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
                 VM_ENTRY_PENDING_BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                maybe_log_vm_entry_injection_progress(
-                    self.id,
-                    "blocked",
-                    vector,
-                    pending_before,
-                    pending_before,
-                    rflags,
-                    block_state,
-                    attempt_total,
-                    apic_snapshot,
-                );
+                if progress_trace_enabled {
+                    maybe_log_vm_entry_injection_progress(
+                        self.id,
+                        "blocked",
+                        vector,
+                        pending_before,
+                        pending_before,
+                        rflags,
+                        block_state,
+                        attempt_total,
+                        apic_snapshot,
+                    );
+                }
                 let trace_id = VM_ENTRY_INJECTION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     debug!(
@@ -3991,6 +4040,19 @@ impl<H: AxVCpuHal> AxArchVCpu for VmxVcpu<H> {
                     VmxExitReason::TRIPLE_FAULT => {
                         error!("VMX triple fault: {:#x?}", exit_info);
                         error!("VCpu {:#x?}", self);
+                        let regs = self.regs();
+                        self.log_guest_page_mapping(
+                            "triple-rip",
+                            GuestVirtAddr::from_usize(exit_info.guest_rip),
+                        );
+                        self.log_guest_page_mapping(
+                            "triple-rdi",
+                            GuestVirtAddr::from_usize(regs.rdi as usize),
+                        );
+                        self.log_guest_page_mapping(
+                            "triple-direct-map-base",
+                            GuestVirtAddr::from_usize(0xffff_8880_0000_0000),
+                        );
 
                         self.decode_instruction(
                             GuestVirtAddr::from_usize(exit_info.guest_rip),
@@ -4149,4 +4211,14 @@ impl<H: AxVCpuHal> AxVcpuAccessGuestState for VmxVcpu<H> {
 pub fn invalid_ept(eptp: EPTPointer) -> AxResult<()> {
     use super::instructions::{InvEptType, invept};
     unsafe { invept(InvEptType::SingleContext, eptp.bits()).map_err(as_axerr) }
+}
+
+pub fn invalid_ept_all_contexts() -> AxResult<()> {
+    use super::instructions::{InvEptType, invept};
+    unsafe { invept(InvEptType::Global, 0).map_err(as_axerr) }
+}
+
+pub fn invalid_vpid_all_contexts() -> AxResult<()> {
+    use super::instructions::{InvVpidType, invvpid};
+    unsafe { invvpid(InvVpidType::AllContext, 0, 0).map_err(as_axerr) }
 }

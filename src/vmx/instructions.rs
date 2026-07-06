@@ -34,6 +34,17 @@ pub enum InvEptType {
     Global = 2,
 }
 
+/// INVVPID type. (SDM Vol. 3C, Section 30.3)
+#[repr(u64)]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum InvVpidType {
+    IndividualAddress = 0,
+    SingleContext = 1,
+    AllContext = 2,
+    SingleContextRetainingGlobals = 3,
+}
+
 /// Invalidate Translations Derived from EPT. (SDM Vol. 3C, Section 30.3)
 ///
 /// Invalidates mappings in the translation lookaside buffers (TLBs) and
@@ -45,6 +56,30 @@ pub unsafe fn invept(inv_type: InvEptType, eptp: u64) -> Result<()> {
     let invept_desc = [eptp, 0];
     unsafe {
         asm!("invept {0}, [{1}]", in(reg) inv_type as u64, in(reg) &invept_desc);
+    }
+    vmx_capture_status()
+}
+
+/// Invalidate Translations Based on VPID. (SDM Vol. 3C, Section 30.3)
+pub unsafe fn invvpid(inv_type: InvVpidType, vpid: u16, linear_addr: u64) -> Result<()> {
+    #[repr(C, align(16))]
+    struct InvVpidDescriptor {
+        vpid: u16,
+        reserved: [u16; 3],
+        linear_addr: u64,
+    }
+
+    let invvpid_desc = InvVpidDescriptor {
+        vpid,
+        reserved: [0; 3],
+        linear_addr,
+    };
+    unsafe {
+        asm!(
+            "invvpid {0}, [{1}]",
+            in(reg) inv_type as u64,
+            in(reg) &invvpid_desc
+        );
     }
     vmx_capture_status()
 }

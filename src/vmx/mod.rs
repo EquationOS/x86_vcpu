@@ -20,7 +20,7 @@ pub use self::vcpu::{
 };
 pub use self::vmcs::{VmxExitInfo, VmxInterruptInfo, VmxIoExitInfo};
 
-pub use self::vcpu::invalid_ept;
+pub use self::vcpu::{invalid_ept, invalid_ept_all_contexts, invalid_vpid_all_contexts};
 
 /// Return if current platform support virtualization extension.
 pub fn has_hardware_support() -> bool {

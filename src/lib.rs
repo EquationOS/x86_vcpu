@@ -27,7 +27,7 @@ cfg_if::cfg_if! {
         mod vmx;
         use vmx as vender;
         pub use vmx::{VmxExitInfo, VmxExitReason, VmxInterruptInfo, VmxIoExitInfo};
-        pub use vmx::invalid_ept;
+        pub use vmx::{invalid_ept, invalid_ept_all_contexts, invalid_vpid_all_contexts};
         pub use vmx::{POSTED_INTR_VECTOR, PostedInterruptDescriptor};
         pub use vmx::current_posted_interrupt_destination;
         pub use vmx::PendingEvent;
