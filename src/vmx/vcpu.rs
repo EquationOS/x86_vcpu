@@ -102,8 +102,10 @@ const APIC_MAX_LVT_INDEX: u32 = 6;
 const POSTED_INTERRUPT_SYNC_TRACE_LIMIT: usize = 128;
 const VMX_PREEMPTION_TIMER_TRACE_LIMIT: usize = 32;
 const VM_ENTRY_INJECTION_TRACE_LIMIT: usize = 512;
+const VM_ENTRY_BLOCK_IRQ_TRACE_LIMIT: usize = 512;
 const VM_ENTRY_INJECTION_PROGRESS_SAMPLE_MASK: u64 = 0xff;
 const VM_ENTRY_NON_TIMER_PROGRESS_SAMPLE_MASK: u64 = 0x3f;
+const VM_ENTRY_BLOCK_IRQ_VECTOR: u8 = 0x20;
 const VM_ENTRY_EQUATION_TIMER_VECTOR: u8 = 0xf5;
 const ENABLE_DESCRIPTOR_TABLE_EXITING: bool = cfg!(feature = "microvm-eqgate-idt-exit");
 const ENABLE_EQGATE_NONEXIT_TIMER_EXTINT: bool =
@@ -135,6 +137,7 @@ const XFEATURE_EQGATE_IDT_UNSUPPORTED: u32 = XFEATURE_CET_USER | XFEATURE_CET_KE
 static POSTED_INTERRUPT_SYNC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VMX_PREEMPTION_TIMER_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VM_ENTRY_INJECTION_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static VM_ENTRY_BLOCK_IRQ_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static VM_ENTRY_PENDING_ATTEMPT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VM_ENTRY_PENDING_INJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static VM_ENTRY_PENDING_BLOCKED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -255,6 +258,64 @@ fn maybe_log_vm_entry_injection_progress(
         isr_bit,
         apic_irr_total,
         apic_isr_total
+    );
+}
+
+fn maybe_log_vm_entry_block_irq(
+    vcpu_id: usize,
+    reason: &'static str,
+    pending_before: usize,
+    pending_after: usize,
+    rflags: usize,
+    block_state: u32,
+    entry_info: u32,
+    apic: Option<VmEntryApicSnapshot>,
+) {
+    let trace_id = VM_ENTRY_BLOCK_IRQ_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if trace_id >= VM_ENTRY_BLOCK_IRQ_TRACE_LIMIT {
+        return;
+    }
+
+    let (apic_valid, rvi, svi, tpr, ppr, irr_word, isr_word, irr_bit, isr_bit) =
+        if let Some(snapshot) = apic {
+            (
+                true,
+                snapshot.rvi,
+                snapshot.svi,
+                snapshot.tpr,
+                snapshot.ppr,
+                snapshot.irr_word,
+                snapshot.isr_word,
+                snapshot.irr_bit,
+                snapshot.isr_bit,
+            )
+        } else {
+            (false, 0, 0, 0, 0, 0, 0, false, false)
+        };
+
+    info!(
+        "vCPU block IRQ VM-entry {} trace_id={} vcpu={} vector={:#x} pending_before={} pending_after={} attempts={} injected={} blocked={} rflags={:#x} block_state={:#x} entry_info={:#x} apic_valid={} rvi={:#x} svi={:#x} tpr={:#x} ppr={:#x} irr_word={:#x} isr_word={:#x} irr_bit={} isr_bit={}",
+        reason,
+        trace_id,
+        vcpu_id,
+        VM_ENTRY_BLOCK_IRQ_VECTOR,
+        pending_before,
+        pending_after,
+        VM_ENTRY_PENDING_ATTEMPT_TOTAL.load(Ordering::Relaxed),
+        VM_ENTRY_PENDING_INJECTED_TOTAL.load(Ordering::Relaxed),
+        VM_ENTRY_PENDING_BLOCKED_TOTAL.load(Ordering::Relaxed),
+        rflags,
+        block_state,
+        entry_info,
+        apic_valid,
+        rvi,
+        svi,
+        tpr,
+        ppr,
+        irr_word,
+        isr_word,
+        irr_bit,
+        isr_bit
     );
 }
 
@@ -383,6 +444,7 @@ pub struct VmxVcpu<H: AxVCpuHal> {
     pi_desc: PostedInterruptDescriptor<H>,
     posted_interrupt_enabled: bool,
     vmx_posted_interrupt_enabled: bool,
+    posted_interrupt_auto_sync: bool,
     virtual_apic_page: PhysFrame<H>,
 
     pending_events: Mutex<VecDeque<(u8, Option<u32>)>>,
@@ -419,6 +481,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             pi_desc: PostedInterruptDescriptor::new(POSTED_INTR_VECTOR)?,
             posted_interrupt_enabled: false,
             vmx_posted_interrupt_enabled: false,
+            posted_interrupt_auto_sync: true,
             virtual_apic_page: PhysFrame::alloc_zero()?,
             pending_events: Mutex::new(VecDeque::with_capacity(8)),
             xstate: XState::new(),
@@ -552,7 +615,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
     /// Run the guest. It returns when a vm-exit happens and returns the vm-exit if it cannot be handled by this [`VmxVcpu`] itself.
     pub fn inner_run(&mut self) -> Option<VmxExitInfo> {
         self.last_internal_exit_kind = None;
-        self.sync_posted_interrupts_to_guest().unwrap();
+        if self.posted_interrupt_auto_sync {
+            self.sync_posted_interrupts_to_guest().unwrap();
+        }
 
         // Inject pending events
         if self.launched {
@@ -742,6 +807,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
     pub fn pending_event_count(&self) -> usize {
         self.pending_events.lock().len()
+    }
+
+    pub fn reset_block_irq_trace_count(&mut self) {
+        VM_ENTRY_BLOCK_IRQ_TRACE_COUNT.store(0, Ordering::Relaxed);
     }
 
     pub fn take_pending_events(&mut self) -> VecDeque<PendingEvent> {
@@ -958,6 +1027,16 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
 
         self.pi_desc.take_pending_pir()
+    }
+
+    pub fn set_posted_interrupt_auto_sync(&mut self, enabled: bool) -> bool {
+        let changed = self.posted_interrupt_auto_sync != enabled;
+        self.posted_interrupt_auto_sync = enabled;
+        changed
+    }
+
+    pub fn posted_interrupt_auto_sync(&self) -> bool {
+        self.posted_interrupt_auto_sync
     }
 
     fn queue_posted_pir_events(&mut self, pir: &[u32; 8]) -> usize {
@@ -2802,7 +2881,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -2814,7 +2893,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -2822,7 +2901,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[unsafe(naked)]
+    #[naked]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
@@ -2887,8 +2966,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             let allow_interrupt =
                 rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
                     && block_state == 0;
+            let block_irq_trace_enabled = vector == VM_ENTRY_BLOCK_IRQ_VECTOR;
             let progress_trace_enabled = log::log_enabled!(log::Level::Trace);
-            let apic_snapshot = if progress_trace_enabled {
+            let apic_snapshot = if progress_trace_enabled || block_irq_trace_enabled {
                 self.vm_entry_apic_snapshot(vector)?
             } else {
                 None
@@ -2909,6 +2989,21 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 }
                 VM_ENTRY_PENDING_INJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 let pending_after = self.pending_events.lock().len();
+                if block_irq_trace_enabled {
+                    let entry_info = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+                        .read()
+                        .unwrap_or(0);
+                    maybe_log_vm_entry_block_irq(
+                        self.id,
+                        "injected",
+                        pending_before,
+                        pending_after,
+                        rflags,
+                        block_state,
+                        entry_info,
+                        apic_snapshot,
+                    );
+                }
                 if progress_trace_enabled {
                     maybe_log_vm_entry_injection_progress(
                         self.id,
@@ -2938,6 +3033,21 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
                 VM_ENTRY_PENDING_BLOCKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                if block_irq_trace_enabled {
+                    let entry_info = VmcsControl32::VMENTRY_INTERRUPTION_INFO_FIELD
+                        .read()
+                        .unwrap_or(0);
+                    maybe_log_vm_entry_block_irq(
+                        self.id,
+                        "blocked",
+                        pending_before,
+                        pending_before,
+                        rflags,
+                        block_state,
+                        entry_info,
+                        apic_snapshot,
+                    );
+                }
                 if progress_trace_enabled {
                     maybe_log_vm_entry_injection_progress(
                         self.id,
@@ -3388,7 +3498,11 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         Specifically, the timer counts down by 1 every time bit X in the TSC changes due to a TSC increment.
         The value of X is in the range 0–31 and can be determined by consulting the VMX capability MSR IA32_VMX_MISC (see Appendix A.6).
          */
-        let queued = self.sync_posted_interrupts_to_guest()?;
+        let queued = if self.posted_interrupt_auto_sync {
+            self.sync_posted_interrupts_to_guest()?
+        } else {
+            0
+        };
         let trace_id = VMX_PREEMPTION_TIMER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
         if queued > 0 || trace_id < VMX_PREEMPTION_TIMER_TRACE_LIMIT {
             debug!(
