@@ -2262,13 +2262,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         self.vmx_posted_interrupt_enabled = false;
 
         let needs_x2apic_virtualization = self.vcpu_type == VCPUType::EqParavirtGuest;
-        let eqgate_extint_passthrough = false;
-        if self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT {
-            warn!(
-                "vCPU {} eqgate non-exit timer external interrupt passthrough disabled: host stop/quiesce requires external_interrupt_exiting=true",
-                self.id
-            );
-        }
+        let eqgate_extint_passthrough =
+            self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT;
         let vfio_apicv_disabled =
             self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_MICROVM_VFIO_NO_APICV;
         let posted_interrupt_descriptor_supported =
