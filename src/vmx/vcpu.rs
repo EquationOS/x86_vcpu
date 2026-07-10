@@ -2266,8 +2266,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_EQGATE_NONEXIT_TIMER_EXTINT;
         let vfio_apicv_disabled =
             self.vcpu_type == VCPUType::EqParavirtGuest && ENABLE_MICROVM_VFIO_NO_APICV;
-        let posted_interrupt_descriptor_supported =
-            self.supports_posted_interrupts() && !eqgate_extint_passthrough;
+        let posted_interrupt_descriptor_supported = self.supports_posted_interrupts();
         let use_vmx_posted_interrupt_delivery = self.vcpu_type == VCPUType::EqParavirtGuest
             && posted_interrupt_descriptor_supported
             && !cfg!(feature = "microvm-vfio-posted-exit")
@@ -2346,8 +2345,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         )?;
         if eqgate_extint_passthrough {
             info!(
-                "vCPU {} eqgate non-exit timer external interrupt passthrough experiment enabled: external_interrupt_exiting=false vmx_posted_interrupt_delivery=false posted_descriptor=false timer_msr_guard={}",
+                "vCPU {} eqgate non-exit timer external interrupt passthrough experiment enabled: external_interrupt_exiting=false vmx_posted_interrupt_delivery=false posted_descriptor={} timer_msr_guard={}",
                 self.id,
+                posted_interrupt_descriptor_supported,
                 ENABLE_EQGATE_NONEXIT_TIMER_MSR_GUARD
             );
         }
