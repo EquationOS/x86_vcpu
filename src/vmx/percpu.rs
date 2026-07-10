@@ -69,8 +69,8 @@ impl<H: AxVCpuHal> AxArchPerCpu for VmxPerCpuState<H> {
             ($value: expr, $crx: ident) => {{
                 use Msr::*;
                 let value = $value;
-                let fixed0 = concat_idents!(IA32_VMX_, $crx, _FIXED0).read();
-                let fixed1 = concat_idents!(IA32_VMX_, $crx, _FIXED1).read();
+                let fixed0 = ${concat(IA32_VMX_, $crx, _FIXED0)}.read();
+                let fixed1 = ${concat(IA32_VMX_, $crx, _FIXED1)}.read();
                 (!fixed0 | value != 0) && (fixed1 | !value != 0)
             }};
         }

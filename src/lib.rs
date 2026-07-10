@@ -1,7 +1,6 @@
 #![no_std]
 #![feature(doc_cfg)]
-#![feature(concat_idents)]
-#![feature(naked_functions)]
+#![feature(macro_metavar_expr_concat)]
 #![doc = include_str!("../README.md")]
 
 #[macro_use]

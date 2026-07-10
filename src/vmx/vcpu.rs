@@ -2005,10 +2005,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 use VmcsGuest16::*;
                 use VmcsGuest32::*;
                 use VmcsGuestNW::*;
-                concat_idents!($reg, _SELECTOR).write($seg.selector.bits())?;
-                concat_idents!($reg, _BASE).write($seg.base as _)?;
-                concat_idents!($reg, _LIMIT).write($seg.limit)?;
-                concat_idents!($reg, _ACCESS_RIGHTS).write($seg.access_rights.bits())?;
+                ${concat($reg, _SELECTOR)}.write($seg.selector.bits())?;
+                ${concat($reg, _BASE)}.write($seg.base as _)?;
+                ${concat($reg, _LIMIT)}.write($seg.limit)?;
+                ${concat($reg, _ACCESS_RIGHTS)}.write($seg.access_rights.bits())?;
             }};
         }
 
@@ -2017,10 +2017,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 use VmcsGuest16::*;
                 use VmcsGuest32::*;
                 use VmcsGuestNW::*;
-                concat_idents!($seg, _SELECTOR).write(0)?;
-                concat_idents!($seg, _BASE).write(0)?;
-                concat_idents!($seg, _LIMIT).write(0xffff)?;
-                concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
+                ${concat($seg, _SELECTOR)}.write(0)?;
+                ${concat($seg, _BASE)}.write(0)?;
+                ${concat($seg, _LIMIT)}.write(0xffff)?;
+                ${concat($seg, _ACCESS_RIGHTS)}.write($access_rights)?;
             }};
         }
 
@@ -2152,10 +2152,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 use VmcsGuest16::*;
                 use VmcsGuest32::*;
                 use VmcsGuestNW::*;
-                concat_idents!($reg, _SELECTOR).write($seg.selector.bits())?;
-                concat_idents!($reg, _BASE).write($seg.base as _)?;
-                concat_idents!($reg, _LIMIT).write($seg.limit)?;
-                concat_idents!($reg, _ACCESS_RIGHTS).write($seg.access_rights.bits())?;
+                ${concat($reg, _SELECTOR)}.write($seg.selector.bits())?;
+                ${concat($reg, _BASE)}.write($seg.base as _)?;
+                ${concat($reg, _LIMIT)}.write($seg.limit)?;
+                ${concat($reg, _ACCESS_RIGHTS)}.write($seg.access_rights.bits())?;
             }};
         }
 
@@ -2208,10 +2208,10 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 use VmcsGuest16::*;
                 use VmcsGuest32::*;
                 use VmcsGuestNW::*;
-                concat_idents!($seg, _SELECTOR).write(0)?;
-                concat_idents!($seg, _BASE).write(0)?;
-                concat_idents!($seg, _LIMIT).write(0xffff)?;
-                concat_idents!($seg, _ACCESS_RIGHTS).write($access_rights)?;
+                ${concat($seg, _SELECTOR)}.write(0)?;
+                ${concat($seg, _BASE)}.write(0)?;
+                ${concat($seg, _LIMIT)}.write(0xffff)?;
+                ${concat($seg, _ACCESS_RIGHTS)}.write($access_rights)?;
             }};
         }
 
@@ -2876,7 +2876,7 @@ macro_rules! vmx_entry_with {
 }
 
 impl<H: AxVCpuHal> VmxVcpu<H> {
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmlaunch.
     ///
     /// `#[naked]` is essential here, without it the rust compiler will think `&mut self` is not used and won't give us correct %rdi.
@@ -2888,7 +2888,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmlaunch")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Enter guest with vmresume.
     ///
     /// See [`Self::vmx_launch`] for detail.
@@ -2896,7 +2896,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         vmx_entry_with!("vmresume")
     }
 
-    #[naked]
+    #[unsafe(naked)]
     /// Return after vm-exit.
     ///
     /// The return value is a dummy value.
