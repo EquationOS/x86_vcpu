@@ -342,6 +342,10 @@ pub const EQUATION_PV_FEATURE_IPI: u32 = 1 << 4;
 pub const EQUATION_PV_FEATURE_CPU_RESIZE: u32 = 1 << 5;
 pub const EQUATION_PV_FEATURE_SHADOW_IDT: u32 = 1 << 6;
 pub const EQUATION_PV_FEATURE_HYPERALLOC: u32 = 1 << 7;
+/// No-HLAT plan B: the guest must inject the gate high-half PML4 entry
+/// (`gate_high_half_pdpt_gpa`) into slot 256 of its own page tables, because
+/// HLAT is not programmed on this host. Ignored when HLAT is in use.
+pub const EQUATION_PV_FEATURE_NO_HLAT_GATE_PGD: u32 = 1 << 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -362,6 +366,11 @@ pub struct EquationPvAbi {
     pub desired_vcpu_count: u32,
     pub current_vcpu_apic_id: u32,
     pub vcpu_apic_ids: [u32; 64],
+    /// No-HLAT plan B: GPA of the gate PML4[256] target (the gate `pdpt_high`
+    /// page). The guest writes `gate_high_half_pdpt_gpa | PRESENT|WRITABLE`
+    /// into slot 256 of its page tables to reach the gate high-half without
+    /// HLAT. 0 when HLAT is in use.
+    pub gate_high_half_pdpt_gpa: u64,
 }
 
 impl Default for EquationPvAbi {
@@ -384,6 +393,7 @@ impl Default for EquationPvAbi {
             desired_vcpu_count: 0,
             current_vcpu_apic_id: 0,
             vcpu_apic_ids: [u32::MAX; 64],
+            gate_high_half_pdpt_gpa: 0,
         }
     }
 }
@@ -2124,6 +2134,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             ctx.eptp_list_region_base()
                 .ok_or_else(|| ax_err_type!(InvalidInput, "eptp_list_region_base is None"))?,
         )?;
+        // Under the no-HLAT plan HLATP is never programmed; the gate context
+        // carries no hlat_ptr and that is expected.
+        #[cfg(not(feature = "microvm-eqgate-no-hlat"))]
         self.set_hlat_pointer(
             ctx.hlat_ptr()
                 .ok_or_else(|| ax_err_type!(InvalidInput, "hlat_ptr is None"))?,
@@ -2360,7 +2373,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             val |= CpuCtrl::USE_TPR_SHADOW;
         }
         if self.vcpu_type == VCPUType::EqParavirtGuest {
-            val |= CpuCtrl::TERTIARY_CONTROLS;
+            // The only tertiary control we use is ENABLE_HLAT. Under the no-HLAT
+            // plan we program no tertiary features, so leave tertiary controls
+            // deactivated to keep the VMCS minimal and consistent.
+            #[cfg(not(feature = "microvm-eqgate-no-hlat"))]
+            {
+                val |= CpuCtrl::TERTIARY_CONTROLS;
+            }
         }
         vmcs::set_control(
             VmcsControl32::PRIMARY_PROCBASED_EXEC_CONTROLS,
@@ -2430,6 +2449,12 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         }
 
         // Set tertiary processor-based controls.
+        //
+        // With the no-HLAT plan (feature `microvm-eqgate-no-hlat`) the gate
+        // high-half is reached through injected guest page tables instead of
+        // HLAT, so we neither enable HLAT nor program HLATP; VMFUNC / EPTP list
+        // (configured above) remain the switch mechanism.
+        #[cfg(not(feature = "microvm-eqgate-no-hlat"))]
         if self.vcpu_type == VCPUType::EqParavirtGuest {
             use TertiaryControls as CpuCtrl3;
 
@@ -3764,8 +3789,9 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             3 => CpuIdResult {
                 eax: abi.vcpu_rsp_slot_base_gpa as u32,
                 ebx: (abi.vcpu_rsp_slot_base_gpa >> 32) as u32,
-                ecx: 0,
-                edx: 0,
+                // No-HLAT plan B: gate high-half PML4[256] target GPA (0 under HLAT).
+                ecx: abi.gate_high_half_pdpt_gpa as u32,
+                edx: (abi.gate_high_half_pdpt_gpa >> 32) as u32,
             },
             subleaf if subleaf >= 0x80 => {
                 let index = (subleaf - 0x80) as usize;

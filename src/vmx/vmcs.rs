@@ -47,13 +47,16 @@ macro_rules! vmcs_write {
     ($field_enum: ident, u64) => {
         impl $field_enum {
             pub fn write(self, value: u64) -> AxResult {
+                let field = self as u32;
                 #[cfg(target_pointer_width = "64")]
                 unsafe {
-                    vmx::vmwrite(self as u32, value).map_err(as_axerr)
+                    vmx::vmwrite(field, value).map_err(|e| {
+                        log::warn!("VMWRITE failed at VMCS field={:#x}", field);
+                        as_axerr(e)
+                    })
                 }
                 #[cfg(target_pointer_width = "32")]
                 unsafe {
-                    let field = self as u32;
                     vmx::vmwrite(field, value & 0xffff_ffff).map_err(as_axerr)?;
                     vmx::vmwrite(field + 1, value >> 32).map_err(as_axerr)?;
                     Ok(())
@@ -64,7 +67,13 @@ macro_rules! vmcs_write {
     ($field_enum: ident, $ux: ty) => {
         impl $field_enum {
             pub fn write(self, value: $ux) -> AxResult {
-                unsafe { vmx::vmwrite(self as u32, value as u64).map_err(as_axerr) }
+                let field = self as u32;
+                unsafe {
+                    vmx::vmwrite(field, value as u64).map_err(|e| {
+                        log::warn!("VMWRITE failed at VMCS field={:#x}", field);
+                        as_axerr(e)
+                    })
+                }
             }
         }
     };
