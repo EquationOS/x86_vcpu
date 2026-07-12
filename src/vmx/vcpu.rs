@@ -382,6 +382,9 @@ pub struct EquationPvAbi {
     /// O1: gate high-half VA of this vCPU's per-pCPU GateRegion install entry
     /// (hyperalloc_install_queue[0]) that root arms and the trampoline reads.
     pub install_entry_gate_va: u64,
+    /// O1: this guest's own EPTP-list index (= instance id), so the eqgate-call
+    /// trampoline can VMFUNC back to the guest EPTP after the gate write.
+    pub guest_eptp_index: u32,
 }
 
 impl Default for EquationPvAbi {
@@ -407,6 +410,7 @@ impl Default for EquationPvAbi {
             gate_high_half_pdpt_gpa: 0,
             install_trampoline_va: 0,
             install_entry_gate_va: 0,
+            guest_eptp_index: 0,
         }
     }
 }
@@ -3814,6 +3818,13 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 ebx: (abi.install_trampoline_va >> 32) as u32,
                 ecx: abi.install_entry_gate_va as u32,
                 edx: (abi.install_entry_gate_va >> 32) as u32,
+            },
+            // O1: guest's own EPTP index for the eqgate-call return VMFUNC.
+            0x101 => CpuIdResult {
+                eax: abi.guest_eptp_index,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
             },
             subleaf if subleaf >= 0x80 => {
                 let index = (subleaf - 0x80) as usize;
