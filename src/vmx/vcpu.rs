@@ -346,6 +346,11 @@ pub const EQUATION_PV_FEATURE_HYPERALLOC: u32 = 1 << 7;
 /// (`gate_high_half_pdpt_gpa`) into slot 256 of its own page tables, because
 /// HLAT is not programmed on this host. Ignored when HLAT is in use.
 pub const EQUATION_PV_FEATURE_NO_HLAT_GATE_PGD: u32 = 1 << 8;
+/// O1: the guest may install a HyperAlloc frame via an independent synchronous
+/// eqgate-call (`install_trampoline_va`) that writes the root-pre-armed EPT PDE
+/// directly (VMFUNC into the gate, no root VM-exit), instead of the install
+/// hypercall. Requires `install_trampoline_va` + `install_entry_gate_va` set.
+pub const EQUATION_PV_FEATURE_EQGATE_INSTALL: u32 = 1 << 9;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -371,6 +376,12 @@ pub struct EquationPvAbi {
     /// into slot 256 of its page tables to reach the gate high-half without
     /// HLAT. 0 when HLAT is in use.
     pub gate_high_half_pdpt_gpa: u64,
+    /// O1: gate VA of the independent eqgate-call install trampoline
+    /// (`equation_install_to_gate`), 0 if unavailable.
+    pub install_trampoline_va: u64,
+    /// O1: gate high-half VA of this vCPU's per-pCPU GateRegion install entry
+    /// (hyperalloc_install_queue[0]) that root arms and the trampoline reads.
+    pub install_entry_gate_va: u64,
 }
 
 impl Default for EquationPvAbi {
@@ -394,6 +405,8 @@ impl Default for EquationPvAbi {
             current_vcpu_apic_id: 0,
             vcpu_apic_ids: [u32::MAX; 64],
             gate_high_half_pdpt_gpa: 0,
+            install_trampoline_va: 0,
+            install_entry_gate_va: 0,
         }
     }
 }
@@ -3792,6 +3805,15 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 // No-HLAT plan B: gate high-half PML4[256] target GPA (0 under HLAT).
                 ecx: abi.gate_high_half_pdpt_gpa as u32,
                 edx: (abi.gate_high_half_pdpt_gpa >> 32) as u32,
+            },
+            // O1: independent eqgate-call install ABI. eax/ebx = trampoline VA,
+            // ecx/edx = per-vCPU GateRegion install entry VA. Subleaf 0x100 to
+            // avoid the 4+vcpu (apic id) and 0x80+vcpu (gate rsp) ranges.
+            0x100 => CpuIdResult {
+                eax: abi.install_trampoline_va as u32,
+                ebx: (abi.install_trampoline_va >> 32) as u32,
+                ecx: abi.install_entry_gate_va as u32,
+                edx: (abi.install_entry_gate_va >> 32) as u32,
             },
             subleaf if subleaf >= 0x80 => {
                 let index = (subleaf - 0x80) as usize;
