@@ -379,8 +379,9 @@ pub struct EquationPvAbi {
     /// O1: gate VA of the independent eqgate-call install trampoline
     /// (`equation_install_to_gate`), 0 if unavailable.
     pub install_trampoline_va: u64,
-    /// O1: gate high-half VA of this vCPU's per-pCPU GateRegion install entry
-    /// (hyperalloc_install_queue[0]) that root arms and the trampoline reads.
+    /// O1: gate high-half VA of the instance-shared HyperAlloc fastpath slot
+    /// array anchored in vCPU0's pCPU GateRegion. Root arms this array and every
+    /// vCPU's synchronous install trampoline scans it.
     pub install_entry_gate_va: u64,
     /// O1: this guest's own EPTP-list index (= instance id), so the eqgate-call
     /// trampoline can VMFUNC back to the guest EPTP after the gate write.
