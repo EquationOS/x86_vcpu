@@ -346,11 +346,13 @@ pub const EQUATION_PV_FEATURE_HYPERALLOC: u32 = 1 << 7;
 /// (`gate_high_half_pdpt_gpa`) into slot 256 of its own page tables, because
 /// HLAT is not programmed on this host. Ignored when HLAT is in use.
 pub const EQUATION_PV_FEATURE_NO_HLAT_GATE_PGD: u32 = 1 << 8;
-/// O1: the guest may install a HyperAlloc frame via an independent synchronous
-/// eqgate-call (`install_trampoline_va`) that writes the root-pre-armed EPT PDE
-/// directly (VMFUNC into the gate, no root VM-exit), instead of the install
-/// hypercall. Requires `install_trampoline_va` + `install_entry_gate_va` set.
+/// Legacy ABI v1: bounded per-pCPU fastpath slot array. New EqVisor builds do
+/// not publish this bit; retaining the definition makes mixed-version guests
+/// fail closed to HVC instead of misinterpreting the ABI payload.
 pub const EQUATION_PV_FEATURE_EQGATE_INSTALL: u32 = 1 << 9;
+/// ABI v2: the guest may synchronously install a HyperAlloc frame through a
+/// per-instance, GPA-indexed registry and stable EPT-PD aliases.
+pub const EQUATION_PV_FEATURE_EQGATE_INSTALL_REGISTRY: u32 = 1 << 10;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -379,10 +381,9 @@ pub struct EquationPvAbi {
     /// O1: gate VA of the independent eqgate-call install trampoline
     /// (`equation_install_to_gate`), 0 if unavailable.
     pub install_trampoline_va: u64,
-    /// O1: gate high-half VA of the instance-shared HyperAlloc fastpath slot
-    /// array anchored in vCPU0's pCPU GateRegion. Root arms this array and every
-    /// vCPU's synchronous install trampoline scans it.
-    pub install_entry_gate_va: u64,
+    /// ABI v2: gate high-half VA of the per-instance HyperAlloc registry. Every
+    /// vCPU directly indexes it by `frame_gpa >> 21`.
+    pub install_registry_gate_va: u64,
     /// O1: this guest's own EPTP-list index (= instance id), so the eqgate-call
     /// trampoline can VMFUNC back to the guest EPTP after the gate write.
     pub guest_eptp_index: u32,
@@ -410,7 +411,7 @@ impl Default for EquationPvAbi {
             vcpu_apic_ids: [u32::MAX; 64],
             gate_high_half_pdpt_gpa: 0,
             install_trampoline_va: 0,
-            install_entry_gate_va: 0,
+            install_registry_gate_va: 0,
             guest_eptp_index: 0,
         }
     }
@@ -3817,8 +3818,8 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
             0x100 => CpuIdResult {
                 eax: abi.install_trampoline_va as u32,
                 ebx: (abi.install_trampoline_va >> 32) as u32,
-                ecx: abi.install_entry_gate_va as u32,
-                edx: (abi.install_entry_gate_va >> 32) as u32,
+                ecx: abi.install_registry_gate_va as u32,
+                edx: (abi.install_registry_gate_va >> 32) as u32,
             },
             // O1: guest's own EPTP index for the eqgate-call return VMFUNC.
             0x101 => CpuIdResult {
