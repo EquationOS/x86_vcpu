@@ -40,8 +40,8 @@ use super::vmcs::{
 use crate::context::{GuestContext, VCpuSetupContext};
 use crate::frame::PhysFrame;
 use crate::generated::msr_index::{
-    MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_TSC_DEADLINE, MSR_IA32_XFD,
-    MSR_IA32_XFD_ERR, MSR_IA32_XSS,
+    MSR_IA32_APICBASE, MSR_IA32_TSC_ADJUST, MSR_IA32_TSC_DEADLINE, MSR_IA32_XFD, MSR_IA32_XFD_ERR,
+    MSR_IA32_XSS,
 };
 use crate::page_table::GuestPageTable64;
 use crate::page_table::GuestPageWalkInfo;
@@ -353,6 +353,7 @@ pub const EQUATION_PV_FEATURE_EQGATE_INSTALL: u32 = 1 << 9;
 /// ABI v2: the guest may synchronously install a HyperAlloc frame through a
 /// per-instance, GPA-indexed registry and stable EPT-PD aliases.
 pub const EQUATION_PV_FEATURE_EQGATE_INSTALL_REGISTRY: u32 = 1 << 10;
+pub const EQUATION_PV_FEATURE_HYPERALLOC_SHARED_RESIZE: u32 = 1 << 11;
 
 #[derive(Clone, Copy, Debug)]
 pub struct EquationPvAbi {
@@ -2997,8 +2998,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
         if let Some(event) = event {
             let vector = event.0;
             let pending_before = self.pending_events.lock().len();
-            let attempt_total =
-                VM_ENTRY_PENDING_ATTEMPT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            let attempt_total = VM_ENTRY_PENDING_ATTEMPT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
             update_vm_entry_pending_max_depth(pending_before);
             let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
             let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
@@ -3060,12 +3060,7 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
                 if trace_id < VM_ENTRY_INJECTION_TRACE_LIMIT {
                     debug!(
                         "vCPU {} VM-entry inject vector={:#x} pending_before={} pending_after={} rflags={:#x} block_state={:#x}",
-                        self.id,
-                        vector,
-                        pending_before,
-                        pending_after,
-                        rflags,
-                        block_state
+                        self.id, vector, pending_before, pending_after, rflags, block_state
                     );
                 }
             } else {
@@ -3211,45 +3206,45 @@ impl<H: AxVCpuHal> VmxVcpu<H> {
 
         match ecx {
             MSR_IA32_TSC_DEADLINE if self.eqgate_nonexit_timer_msr_guard_active() => {
-                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
-                {
-                    (unsafe { rdmsr(ecx) }, "gate-read")
-                } else {
-                    (self.eqgate_timer_msr_shadow.tsc_deadline, "read")
-                };
+                let (msr_value, access) =
+                    if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                        (unsafe { rdmsr(ecx) }, "gate-read")
+                    } else {
+                        (self.eqgate_timer_msr_shadow.tsc_deadline, "read")
+                    };
                 self.regs_mut().rax = msr_value;
                 self.regs_mut().rdx = msr_value >> 32;
                 self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
             }
             MSR_IA32_X2APIC_LVT_TIMER if self.eqgate_nonexit_timer_msr_guard_active() => {
-                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
-                {
-                    (unsafe { rdmsr(ecx) }, "gate-read")
-                } else {
-                    (self.eqgate_timer_msr_shadow.x2apic_lvt_timer, "read")
-                };
+                let (msr_value, access) =
+                    if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                        (unsafe { rdmsr(ecx) }, "gate-read")
+                    } else {
+                        (self.eqgate_timer_msr_shadow.x2apic_lvt_timer, "read")
+                    };
                 self.regs_mut().rax = msr_value;
                 self.regs_mut().rdx = msr_value >> 32;
                 self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
             }
             MSR_IA32_X2APIC_INIT_COUNT if self.eqgate_nonexit_timer_msr_guard_active() => {
-                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
-                {
-                    (unsafe { rdmsr(ecx) }, "gate-read")
-                } else {
-                    (self.eqgate_timer_msr_shadow.x2apic_init_count, "read")
-                };
+                let (msr_value, access) =
+                    if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                        (unsafe { rdmsr(ecx) }, "gate-read")
+                    } else {
+                        (self.eqgate_timer_msr_shadow.x2apic_init_count, "read")
+                    };
                 self.regs_mut().rax = msr_value;
                 self.regs_mut().rdx = msr_value >> 32;
                 self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);
             }
             MSR_IA32_X2APIC_DIV_CONF if self.eqgate_nonexit_timer_msr_guard_active() => {
-                let (msr_value, access) = if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64)
-                {
-                    (unsafe { rdmsr(ecx) }, "gate-read")
-                } else {
-                    (self.eqgate_timer_msr_shadow.x2apic_div_conf, "read")
-                };
+                let (msr_value, access) =
+                    if self.eqgate_rip_is_gate_kernel(exit_info.guest_rip as u64) {
+                        (unsafe { rdmsr(ecx) }, "gate-read")
+                    } else {
+                        (self.eqgate_timer_msr_shadow.x2apic_div_conf, "read")
+                    };
                 self.regs_mut().rax = msr_value;
                 self.regs_mut().rdx = msr_value >> 32;
                 self.trace_eqgate_timer_msr_guard(access, ecx, msr_value);

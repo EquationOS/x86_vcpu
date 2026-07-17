@@ -14,12 +14,11 @@ pub use self::structs::{POSTED_INTR_VECTOR, PostedInterruptDescriptor};
 pub use self::vcpu::{
     EQUATION_PV_FEATURE_APIC_ID, EQUATION_PV_FEATURE_CEDE, EQUATION_PV_FEATURE_CPU_RESIZE,
     EQUATION_PV_FEATURE_EQGATE_INSTALL, EQUATION_PV_FEATURE_EQGATE_INSTALL_REGISTRY,
-    EQUATION_PV_FEATURE_HYPERALLOC, EQUATION_PV_FEATURE_IPI,
-    EQUATION_PV_FEATURE_NO_HLAT_GATE_PGD,
-    EQUATION_PV_FEATURE_SHADOW_IDT,
+    EQUATION_PV_FEATURE_HYPERALLOC, EQUATION_PV_FEATURE_HYPERALLOC_SHARED_RESIZE,
+    EQUATION_PV_FEATURE_IPI, EQUATION_PV_FEATURE_NO_HLAT_GATE_PGD, EQUATION_PV_FEATURE_SHADOW_IDT,
     EQUATION_PV_FEATURE_SMP, EQUATION_PV_FEATURE_TIMER, EqGateResumeContext, EquationPvAbi,
-    PendingEvent, VmxInternalExitKind,
-    VmxVcpu as VmxArchVCpu, current_posted_interrupt_destination,
+    PendingEvent, VmxInternalExitKind, VmxVcpu as VmxArchVCpu,
+    current_posted_interrupt_destination,
 };
 pub use self::vmcs::{VmxExitInfo, VmxInterruptInfo, VmxIoExitInfo};
 
